@@ -1931,6 +1931,7 @@ static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
     char *cmd1, *cmd2;
     RIL_SMS_Response response;
     ATResponse *p_response = NULL;
+    char *line;
 
     smsc = ((const char **)data)[0];
     pdu = ((const char **)data)[1];
@@ -1951,7 +1952,18 @@ static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
 
     memset(&response, 0, sizeof(response));
 
-    /* FIXME fill in messageRef and ackPDU */
+    line = p_response->p_intermediates->line;
+
+    err = at_tok_start(&line);
+    if (err < 0) goto error;
+
+    err = at_tok_nextint(&line, &(response.messageRef));
+    if (err < 0) goto error;
+
+    if (at_tok_hasmore(&line)) {
+        err = at_tok_nextstr(&line, &(response.ackPDU));
+        if (err < 0) goto error;
+    }
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
     at_response_free(p_response);
