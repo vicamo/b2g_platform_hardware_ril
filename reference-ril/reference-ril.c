@@ -2187,23 +2187,30 @@ error:
 static void requestSMSAcknowledge(void *data, size_t datalen, RIL_Token t)
 {
     int ackSuccess;
+    ATResponse *p_response = NULL;
     int err;
 
     ackSuccess = ((int *)data)[0];
 
     if (ackSuccess == 1) {
-        err = at_send_command("AT+CNMA=1", NULL);
+        err = at_send_command("AT+CNMA=1", &p_response);
     } else if (ackSuccess == 0)  {
-        err = at_send_command("AT+CNMA=2", NULL);
+        err = at_send_command("AT+CNMA=2", &p_response);
     } else {
         ALOGE("unsupported arg to RIL_REQUEST_SMS_ACKNOWLEDGE\n");
         goto error;
     }
 
+    if (err != 0 || p_response->success == 0) goto error;
+
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+
+    at_response_free(p_response);
+    return;
+
 error:
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-
+    at_response_free(p_response);
 }
 
 static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
