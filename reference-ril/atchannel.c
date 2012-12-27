@@ -229,6 +229,9 @@ static void handleFinalResponse(const char *line)
     sp_response->finalResponse = strdup(line);
 
     pthread_cond_signal(&s_commandcond);
+
+    // Wait the response being taken.
+    pthread_cond_wait(&s_commandcond, &s_commandmutex);
 }
 
 static void handleUnsolicited(const char *line)
@@ -577,6 +580,9 @@ static void clearPendingCommand()
     sp_response = NULL;
     s_responsePrefix = NULL;
     s_smsPDU = NULL;
+
+    // Signal readerLoop that the response was already taken.
+    pthread_cond_signal(&s_commandcond);
 }
 
 
