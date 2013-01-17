@@ -1016,3 +1016,38 @@ AT_CME_Error at_get_cme_error(const ATResponse *p_response)
     return (AT_CME_Error) ret;
 }
 
+/**
+ * Returns error code from response
+ */
+AT_CMS_Error at_get_cms_error(const ATResponse *p_response)
+{
+    int ret;
+    int err;
+    char *p_cur;
+
+    if (p_response->success > 0) {
+        return CMS_SUCCESS;
+    }
+
+    if (p_response->finalResponse == NULL
+        || !strStartsWith(p_response->finalResponse, "+CMS ERROR:")
+    ) {
+        return CMS_ERROR_NON_CMS;
+    }
+
+    p_cur = p_response->finalResponse;
+    err = at_tok_start(&p_cur);
+
+    if (err < 0) {
+        return CMS_ERROR_NON_CMS;
+    }
+
+    err = at_tok_nextint(&p_cur, &ret);
+
+    if (err < 0) {
+        return CMS_ERROR_NON_CMS;
+    }
+
+    return (AT_CMS_Error) ret;
+}
+

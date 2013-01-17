@@ -1932,6 +1932,7 @@ static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
     RIL_SMS_Response response;
     ATResponse *p_response = NULL;
     char *line;
+    RIL_Errno rile = RIL_E_GENERIC_FAILURE;
 
     smsc = ((const char **)data)[0];
     pdu = ((const char **)data)[1];
@@ -1947,30 +1948,36 @@ static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
     asprintf(&cmd2, "%s%s", smsc, pdu);
 
     err = at_send_command_sms(cmd1, cmd2, "+CMGS:", &p_response);
+    if (err != 0) goto error;
 
-    if (err != 0 || p_response->success == 0) goto error;
+    switch (at_get_cms_error(p_response)) {
+        case CMS_SUCCESS:
+            memset(&response, 0, sizeof(response));
 
-    memset(&response, 0, sizeof(response));
+            line = p_response->p_intermediates->line;
 
-    line = p_response->p_intermediates->line;
+            err = at_tok_start(&line);
+            if (err < 0) goto error;
 
-    err = at_tok_start(&line);
-    if (err < 0) goto error;
+            err = at_tok_nextint(&line, &(response.messageRef));
+            if (err < 0) goto error;
 
-    err = at_tok_nextint(&line, &(response.messageRef));
-    if (err < 0) goto error;
+            if (at_tok_hasmore(&line)) {
+                err = at_tok_nextstr(&line, &(response.ackPDU));
+                if (err < 0) goto error;
+            }
 
-    if (at_tok_hasmore(&line)) {
-        err = at_tok_nextstr(&line, &(response.ackPDU));
-        if (err < 0) goto error;
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+            at_response_free(p_response);
+            return;
+
+        case CMS_TEMPORARY_FAILURE:
+            rile = RIL_E_SMS_SEND_FAIL_RETRY;
+            break;
     }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
-    at_response_free(p_response);
-
-    return;
 error:
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    RIL_onRequestComplete(t, rile, NULL, 0);
     at_response_free(p_response);
 }
 
