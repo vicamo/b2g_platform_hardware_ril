@@ -199,6 +199,7 @@ static pthread_cond_t s_state_cond = PTHREAD_COND_INITIALIZER;
 static int s_port = -1;
 static const char * s_device_path = NULL;
 static int          s_device_socket = 0;
+static const char * s_client_id = NULL;
 
 /* trigger change to this with s_state_cond */
 static int s_closed = 0;
@@ -3203,6 +3204,25 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         RIL_onUnsolicitedResponse (
             RIL_UNSOL_RESPONSE_NEW_SMS_STATUS_REPORT,
             sms_pdu, strlen(sms_pdu));
+    } else if (strStartsWith(s, "+CBM:")) {
+        const int str_len = strlen(sms_pdu);
+        const int pdu_len = str_len / 2;
+        unsigned char *pdu, *p;
+        char c;
+        int i = 0;
+        p = pdu = (unsigned char *) malloc(sizeof(unsigned char) * pdu_len);
+        while (i < pdu_len * 2) {
+            c = sms_pdu[i++]; // High byte
+            *p = (((c >= 'a') ? (c - 'a' + 10) : (c - '0')) << 4) & 0xF0;
+            c = sms_pdu[i++]; // Low byte
+            *p |= ((c >= 'a') ? (c - 'a' + 10) : (c - '0')) & 0x0F;
+
+            ++p;
+        }
+        RIL_onUnsolicitedResponse (
+            RIL_UNSOL_RESPONSE_NEW_BROADCAST_SMS,
+            pdu, pdu_len);
+       free((char*)pdu);
     } else if (strStartsWith(s, "+CGEV:")) {
         /* Really, we can ignore NW CLASS and ME CLASS events here,
          * but right now we don't since extranous
@@ -3348,12 +3368,18 @@ mainLoop(void *param)
             if (s_port > 0) {
                 fd = socket_loopback_client(s_port, SOCK_STREAM);
             } else if (s_device_socket) {
+                if (!s_client_id) {
+                    s_client_id = "";
+                }
+
                 if (!strcmp(s_device_path, "/dev/socket/qemud")) {
                     /* Before trying to connect to /dev/socket/qemud (which is
                      * now another "legacy" way of communicating with the
                      * emulator), we will try to connecto to gsm service via
                      * qemu pipe. */
-                    fd = qemu_pipe_open("qemud:gsm");
+                    char buffer[32];
+                    snprintf(buffer, sizeof(buffer), "qemud:gsm%s", s_client_id);
+                    fd = qemu_pipe_open(buffer);
                     if (fd < 0) {
                         /* Qemu-specific control socket */
                         fd = socket_local_client( "qemud",
@@ -3361,8 +3387,8 @@ mainLoop(void *param)
                                                   SOCK_STREAM );
                         if (fd >= 0 ) {
                             char  answer[2];
-
-                            if ( write(fd, "gsm", 3) != 3 ||
+                            int len = snprintf(buffer, sizeof(buffer), "gsm%s", s_client_id);
+                            if ( write(fd, buffer, len) != len ||
                                  read(fd, answer, 2) != 2 ||
                                  memcmp(answer, "OK", 2) != 0)
                             {
@@ -3426,7 +3452,7 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
 
     s_rilenv = env;
 
-    while ( -1 != (opt = getopt(argc, argv, "p:d:s:"))) {
+    while ( -1 != (opt = getopt(argc, argv, "p:d:s:c:"))) {
         switch (opt) {
             case 'p':
                 s_port = atoi(optarg);
@@ -3448,13 +3474,19 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
                 ALOGI("Opening socket %s\n", s_device_path);
             break;
 
+            case 'c':
+                s_client_id = optarg;
+                ALOGI("Client ID %s\n", s_client_id);
+            break;
+
             default:
                 usage(argv[0]);
                 return NULL;
         }
     }
 
-    if (s_port < 0 && s_device_path == NULL) {
+    if ((s_port < 0 && s_device_path == NULL)
+        || (s_client_id && !s_device_socket)) {
         usage(argv[0]);
         return NULL;
     }
@@ -3477,7 +3509,7 @@ int main (int argc, char **argv)
     int fd = -1;
     int opt;
 
-    while ( -1 != (opt = getopt(argc, argv, "p:d:"))) {
+    while ( -1 != (opt = getopt(argc, argv, "p:d:s:c:"))) {
         switch (opt) {
             case 'p':
                 s_port = atoi(optarg);
@@ -3498,12 +3530,18 @@ int main (int argc, char **argv)
                 ALOGI("Opening socket %s\n", s_device_path);
             break;
 
+            case 'c':
+                s_client_id = optarg;
+                ALOGI("Client ID %s\n", s_client_id);
+            break;
+
             default:
                 usage(argv[0]);
         }
     }
 
-    if (s_port < 0 && s_device_path == NULL) {
+    if ((s_port < 0 && s_device_path == NULL)
+        || (s_client_id && !s_device_socket)) {
         usage(argv[0]);
     }
 
