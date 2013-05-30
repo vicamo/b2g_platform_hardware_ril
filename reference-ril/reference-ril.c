@@ -1641,6 +1641,17 @@ static void requestOperator(void *data, size_t datalen, RIL_Token t)
 
     if (err != 0) goto error;
 
+    switch (at_get_cme_error(p_response)) {
+        case CME_SUCCESS:
+            break;
+
+        case CME_NO_NETWORK_SERVICE:
+            goto done;
+
+        default:
+            goto error;
+    }
+
     for (i = 0, p_cur = p_response->p_intermediates
             ; p_cur != NULL
             ; p_cur = p_cur->p_next, i++
@@ -1678,6 +1689,7 @@ static void requestOperator(void *data, size_t datalen, RIL_Token t)
         goto error;
     }
 
+done:
     RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
     at_response_free(p_response);
 
