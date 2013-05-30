@@ -2590,7 +2590,11 @@ getRUIMStatus()
     char *cpinLine;
     char *cpinResult;
 
-    if (sState == RADIO_STATE_OFF || sState == RADIO_STATE_UNAVAILABLE) {
+    if (sState == RADIO_STATE_OFF) {
+        ret = SIM_ABSENT;
+        goto done;
+    }
+    if (sState == RADIO_STATE_UNAVAILABLE) {
         ret = SIM_NOT_READY;
         goto done;
     }
@@ -2668,7 +2672,11 @@ getSIMStatus()
     char *cpinResult;
 
     ALOGD("getSIMStatus(). sState: %d",sState);
-    if (sState == RADIO_STATE_OFF || sState == RADIO_STATE_UNAVAILABLE) {
+    if (sState == RADIO_STATE_OFF) {
+        ret = SIM_ABSENT;
+        goto done;
+    }
+    if (sState == RADIO_STATE_UNAVAILABLE) {
         ret = SIM_NOT_READY;
         goto done;
     }
