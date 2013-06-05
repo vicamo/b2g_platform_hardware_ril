@@ -1198,6 +1198,57 @@ static void requestGetPreferredNetworkType(int request, void *data,
 
 }
 
+static int requestGetGsmBroadcastConfig(RIL_GSM_BroadcastSmsConfigInfo **infos,
+                                        int *entryCount)
+{
+    ATResponse *p_response = NULL;
+    int err;
+    char *line, *mode, *mids, *dcss;
+
+    err = at_send_command_singleline(cmd, "AT+CSCB?", &p_response);
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    line = p_response->p_intermediates->line;
+
+    // +CSCB: <mode>,<mids>,<dcss>
+    err = at_tok_start(&line);
+    if (err < 0) goto error;
+
+    err = at_tok_nextstr(&line, &mode);
+    if (err < 0 || !mode) goto error;
+
+    err = at_tok_nextstr(&line, &mids);
+    if (err < 0 || !mids) goto error;
+
+    err = at_tok_nextstr(&line, &dcss);
+    if (err < 0 || !dcss) goto error;
+
+    // FIXME
+
+error:
+    at_response_free(p_response);
+    return -1;
+}
+
+static void requestSetGsmBroadcastConfig(int request, void *data,
+                                         int datalen, RIL_Tokent)
+{
+    RIL_GSM_BroadcastSmsConfigInfo *infos = data;
+    int i, n, entryCount = datalen / sizeof(info);
+    char buf[2][256];
+    char* pos[2];
+
+    pos[0] = buf[0];
+    pos[1] = buf[1];
+
+    for (i = 0; i < entryCount; ++i) {
+        RIL_GSM_BroadcastSmsConfigInfo *info = &infos[i];
+        if ()
+    }
+}
+
 static void requestCdmaPrlVersion(int request, void *data,
                                    size_t datalen, RIL_Token t)
 {
@@ -2605,6 +2656,26 @@ onGsmSpecificRequest (int request, void *data, size_t datalen, RIL_Token t)
 
             break;
         }
+
+        case RIL_REQUEST_GSM_GET_BROADCAST_CONFIG: {
+            RIL_GSM_BroadcastSmsConfigInfo *infos;
+            int err, entryCount;
+
+            err = requestGetGsmBroadcastConfig(&infos, &entryCount);
+            if (err < 0) {
+                RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS,
+                    (void *) infos, entryCount * sizeof(infos));
+                free(infos);
+            }
+
+            break;
+        }
+
+        case RIL_REQUEST_GSM_SET_BROADCAST_CONFIG:
+            requestSetGsmBroadcastConfig(request, data, datalen, t);
+            break;
 
         default:
             ALOGD("Request not supported. Tech: %d",TECH(sMdmInfo));
