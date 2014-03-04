@@ -1985,21 +1985,31 @@ error:
 static int configureInterface(const char* ifname, const char *addr)
 {
     char ip[INET6_ADDRSTRLEN];
-    int prefixLen, ret = -1;
+    int prefixLen, len, ret = -1;
 
     ALOGD("%s: ifname=%s, addr=%s", __FUNCTION__, ifname, addr);
-    if (2 != sscanf(addr, "%[.:0-9a-f]/%d", ip, &prefixLen)) {
-        ALOGE("%s: failed to parse address", __FUNCTION__);
-        return ret;
-    }
+    do {
+        if (2 != sscanf(addr, "%[.:0-9a-f]/%d%n", ip, &prefixLen, &len)) {
+            ALOGE("%s: failed to parse address", __FUNCTION__);
+            ret = -1;
+            break;
+        }
 
-    ret = ifc_act_on_address(RTM_NEWADDR, ifname, ip, prefixLen);
-    if (ret < 0) {
-        ALOGE("%s: ifc_act_on_address returns %d", __FUNCTION__, ret);
-        return ret;
-    }
+        ret = ifc_act_on_address(RTM_NEWADDR, ifname, ip, prefixLen);
+        if (ret < 0) {
+            ALOGE("%s: ifc_act_on_address returns %d", __FUNCTION__, ret);
+            break;
+        }
 
-    ret = ifc_enable(ifname);
+        addr += len;
+        while (*addr != '\0' && isspace(*addr)) {
+            addr++;
+        }
+    } while(*addr);
+
+    if (!ret) {
+        ret = ifc_enable(ifname);
+    }
     if (ret < 0) {
         ALOGE("%s: ifc_enable returns %d", __FUNCTION__, ret);
         ifc_clear_addresses(ifname);
