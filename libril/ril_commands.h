@@ -132,3 +132,38 @@
     {RIL_REQUEST_SIM_OPEN_CHANNEL, dispatchString, responseInts},
     {RIL_REQUEST_SIM_CLOSE_CHANNEL, dispatchInts, responseVoid},
     {RIL_REQUEST_SIM_TRANSMIT_APDU_CHANNEL, dispatchSIM_APDU, responseSIM_IO},
+    /* unsupported/unused request numbers below */
+    {0, NULL, NULL}, /* 118 */
+    {0, NULL, NULL},
+    {0, NULL, NULL}, /* 120 */
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL}, /* 130 */
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL}, /* 140 */
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    {0, NULL, NULL},
+    /* Mozilla-defined requests below */
+    {RIL_REQUEST_GET_UNLOCK_RETRY_COUNT, dispatchStrings, responseInts},
