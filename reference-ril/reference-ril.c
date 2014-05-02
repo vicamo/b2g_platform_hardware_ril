@@ -239,6 +239,26 @@ static int s_mnc = 0;
 static int s_lac = 0;
 static int s_cid = 0;
 
+/* TS 24.096 clause 4.1 */
+#define  A_CALL_NAME_MAX_SIZE  80
+/* According to 3GPP 22.083 clause 2.2.1, 3GPP 22.084 clause 1.2.1 and 3GPP
+ * 22.030 clause 6.5.5.6, the case of the maximum number is reached "when
+ * there comes an incoming call while we have already one active(held)
+ * conference call (with 5 remote parties) and one held(active) single call."
+ * The maximum number of voice calls is therefore 7.
+ */
+#define  A_MAX_CALL_CONNECTIONS  7
+
+typedef struct {
+    char name[ A_CALL_NAME_MAX_SIZE+1 ];
+    int CNI_validity;
+} CnapInfo;
+
+// Temporary variable to hold +CNAP information, cleaned after requestGetCurrentCalls.
+static CnapInfo sCnapInfo = {'\0', 0};
+// CnapInfoList to hold information associated with call id.
+static CnapInfo sCnapInfoList[ A_MAX_CALL_CONNECTIONS ];
+
 static void pollSIMState (void *param);
 static void setRadioState(RIL_RadioState newState);
 static void setRadioTechnology(ModemInfo *mdm, int newtech);
@@ -261,17 +281,41 @@ static int clccStateToRILState(int state, RIL_CallState *p_state)
 }
 
 /**
+ * Convert CLI Validity to number presenstaion.
+ *
+ * CLI validity is ranged between 0 and 4 defined in TS 27.007 Clause 7.18,
+ * and numberPresentation is ranged between 0 and 3 defined in ril.h.
+ */
+static int convertCliValidity(int cliValidity) {
+    int presentation = 0;
+    if (cliValidity <= 0 || cliValidity > 4) {
+        return presentation;
+    }
+
+    if (cliValidity == 2 || cliValidity == 4) {
+        presentation = 2;
+    } else {
+        presentation = cliValidity;
+    }
+
+    return presentation;
+}
+
+/**
  * Note: directly modified line and has *p_call point directly into
  * modified line
  */
 static int callFromCLCCLine(char *line, RIL_Call *p_call)
 {
-        //+CLCC: 1,0,2,0,0,\"+18005551212\",145
-        //     index,isMT,state,mode,isMpty(,number,TOA)?
+    //+CLCC: 1,0,2,0,0,\"+18005551212\",145,\"\",2,0
+    //     index,isMT,state,mode,isMpty[,<number>,<type>[,<alpha>[,<priority>[,<CLI validity>]]]]
 
     int err;
     int state;
     int mode;
+    char *alpha;
+    int priority;
+    int cliValidity;
 
     err = at_tok_start(&line);
     if (err < 0) goto error;
@@ -312,6 +356,25 @@ static int callFromCLCCLine(char *line, RIL_Call *p_call)
 
         err = at_tok_nextint(&line, &p_call->toa);
         if (err < 0) goto error;
+    }
+
+    if (at_tok_hasmore(&line)) {
+        // alpha is not used yet, simply read and ignore it
+        err = at_tok_nextstr(&line, &alpha);
+        if (err < 0) return 0;
+
+        if (at_tok_hasmore(&line)) {
+            // priority is not used yet, simply read and ignore it
+            err = at_tok_nextint(&line, &priority);
+            if (err < 0) goto error;
+
+            if (at_tok_hasmore(&line)) {
+                err = at_tok_nextint(&line, &cliValidity);
+                if (err < 0) goto error;
+                // mapping CLI validity to numberPresentation based on the definition in ril.h
+                p_call->numberPresentation = convertCliValidity(cliValidity);
+            }
+        }
     }
 
     p_call->uusInfo = NULL;
@@ -718,7 +781,7 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
     int countValidCalls;
     RIL_Call *p_calls;
     RIL_Call **pp_calls;
-    int i;
+    int i, j;
     int needRepoll = 0;
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
@@ -778,7 +841,39 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
             needRepoll = 1;
         }
 
+        // Handle cached CNAP info
+        if (p_calls[countValidCalls].state == RIL_CALL_INCOMING
+            || p_calls[countValidCalls].state == RIL_CALL_WAITING
+        ) {
+            if (strlen(sCnapInfo.name) > 0
+                || (sCnapInfo.CNI_validity > 0 && sCnapInfo.CNI_validity <= 2)) {
+                sCnapInfoList[p_calls[countValidCalls].index - 1] = sCnapInfo;
+                sCnapInfo.name[0] = '\0';
+                sCnapInfo.CNI_validity = 0;
+            }
+        }
+
         countValidCalls++;
+    }
+
+    // Fill up RIL_Call object for name/namePresentation, or clean it.
+    for (i = 0; i < A_MAX_CALL_CONNECTIONS; i++) {
+         if (strlen(sCnapInfoList[i].name) > 0
+             || sCnapInfoList[i].CNI_validity > 0) {
+             for (j = 0; countValidCalls > 0, countValidCalls > j; j++) {
+                 if (p_calls[j].index == i+1) {
+                     p_calls[j].name = sCnapInfoList[i].name;
+                     p_calls[j].namePresentation = sCnapInfoList[i].CNI_validity;
+                     break;
+                 }
+             }
+
+             // no match to current call(s), clear the related CNAP info.
+             if (j >= countValidCalls) {
+                 sCnapInfoList[i].name[0] = '\0';
+                 sCnapInfoList[i].CNI_validity = 0;
+             }
+         }
     }
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
@@ -1466,7 +1561,7 @@ static void requestRegistrationState(int request, void *data,
     char *line;
     int i = 0, j, numElements = 0;
     int count = 3;
-    int type, startfrom;
+    int type;
 
     RLOGD("requestRegistrationState");
     if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
@@ -1501,7 +1596,6 @@ static void requestRegistrationState(int request, void *data,
     if (is3gpp2(type) == 1) {
         RLOGD("registration state type: 3GPP2");
         // TODO: Query modem
-        startfrom = 3;
         if(request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
             asprintf(&responseStr[3], "8");     // EvDo revA
             asprintf(&responseStr[4], "1");     // BSID
@@ -1520,9 +1614,10 @@ static void requestRegistrationState(int request, void *data,
       }
     } else { // type == RADIO_TECH_3GPP
         RLOGD("registration state type: 3GPP");
-        startfrom = 0;
-        asprintf(&responseStr[1], "%x", registration[1]);
-        asprintf(&responseStr[2], "%x", registration[2]);
+        if (registration[1] >= 0)
+            asprintf(&responseStr[1], "%x", registration[1]);
+        if (registration[2] >= 0)
+            asprintf(&responseStr[2], "%x", registration[2]);
         if (count > 3)
             asprintf(&responseStr[3], "%d", registration[3]);
     }
@@ -1538,23 +1633,14 @@ static void requestRegistrationState(int request, void *data,
         // asprintf(&responseStr[5], "1");
     }
 
-    for (j = startfrom; j < numElements; j++) {
-        if (!responseStr[i]) goto error;
-    }
-    free(registration);
-    registration = NULL;
-
     RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, numElements*sizeof(responseStr));
-    for (j = 0; j < numElements; j++ ) {
-        free(responseStr[j]);
-        responseStr[j] = NULL;
-    }
-    free(responseStr);
-    responseStr = NULL;
-    at_response_free(p_response);
+    goto done;
 
-    return;
 error:
+    RLOGE("requestRegistrationState must never return an error when radio is on");
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+
+done:
     if (responseStr) {
         for (j = 0; j < numElements; j++) {
             free(responseStr[j]);
@@ -1563,8 +1649,10 @@ error:
         free(responseStr);
         responseStr = NULL;
     }
-    RLOGE("requestRegistrationState must never return an error when radio is on");
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    if (registration) {
+        free(registration);
+        registration = NULL;
+    }
     at_response_free(p_response);
 }
 
@@ -3878,6 +3966,42 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         }
         free(line);
         RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, &response, sizeof(response));
+    } else if (strStartsWith(s, "+CNAP:")) {
+        char* name = NULL;
+        int namePresentation = 0;
+        int len = 0;
+        line = p = strdup(s);
+        if (!line) {
+            ALOGE("+CNAP: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextstr(&p, &name) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextint(&p, &namePresentation) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+
+        if (sCnapInfo.CNI_validity == 0) {
+          len  = strlen(name);
+          if (len >= A_CALL_NAME_MAX_SIZE) {
+            len = A_CALL_NAME_MAX_SIZE-1;
+          }
+          strncpy(sCnapInfo.name, name, len);
+        }
+        sCnapInfo.name[len] = '\0';
+        sCnapInfo.CNI_validity = namePresentation;
+
+        free(line);
     }
 }
 
