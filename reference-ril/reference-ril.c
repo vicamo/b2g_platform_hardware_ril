@@ -239,12 +239,49 @@ static int s_mnc = 0;
 static int s_lac = 0;
 static int s_cid = 0;
 
+/* TS 24.096 clause 4.1 */
+#define  A_CALL_NAME_MAX_SIZE  80
+/* According to 3GPP 22.083 clause 2.2.1, 3GPP 22.084 clause 1.2.1 and 3GPP
+ * 22.030 clause 6.5.5.6, the case of the maximum number is reached "when
+ * there comes an incoming call while we have already one active(held)
+ * conference call (with 5 remote parties) and one held(active) single call."
+ * The maximum number of voice calls is therefore 7.
+ */
+#define  A_MAX_CALL_CONNECTIONS  7
+
+static int s_maxDataContexts = 0;
+
+typedef struct {
+    char name[ A_CALL_NAME_MAX_SIZE+1 ];
+    int CNI_validity;
+} CnapInfo;
+
+// Temporary variable to hold +CNAP information, cleaned after requestGetCurrentCalls.
+static CnapInfo sCnapInfo = {'\0', 0};
+// CnapInfoList to hold information associated with call id.
+static CnapInfo sCnapInfoList[ A_MAX_CALL_CONNECTIONS ];
+
 static void pollSIMState (void *param);
 static void setRadioState(RIL_RadioState newState);
 static void setRadioTechnology(ModemInfo *mdm, int newtech);
 static int query_ctec(ModemInfo *mdm, int *current, int32_t *preferred);
 static int parse_technology_response(const char *response, int *current, int32_t *preferred);
 static int techFromModemType(int mdmtype);
+
+static int cmeErrorToRilError(int cmeError) {
+    switch (cmeError) {
+        case CME_SUCCESS:
+            return RIL_E_SUCCESS;
+        case CME_OPERATION_NOT_SUPPORTED:
+            return RIL_E_REQUEST_NOT_SUPPORTED;
+        case CME_SIM_NOT_INSERTED:
+            return RIL_E_SIM_ABSENT;
+        case CME_INCORRECT_PASSWORD:
+            return RIL_E_PASSWORD_INCORRECT;
+    }
+
+    return RIL_E_GENERIC_FAILURE;
+}
 
 static int clccStateToRILState(int state, RIL_CallState *p_state)
 
@@ -261,17 +298,41 @@ static int clccStateToRILState(int state, RIL_CallState *p_state)
 }
 
 /**
+ * Convert CLI Validity to number presenstaion.
+ *
+ * CLI validity is ranged between 0 and 4 defined in TS 27.007 Clause 7.18,
+ * and numberPresentation is ranged between 0 and 3 defined in ril.h.
+ */
+static int convertCliValidity(int cliValidity) {
+    int presentation = 0;
+    if (cliValidity <= 0 || cliValidity > 4) {
+        return presentation;
+    }
+
+    if (cliValidity == 2 || cliValidity == 4) {
+        presentation = 2;
+    } else {
+        presentation = cliValidity;
+    }
+
+    return presentation;
+}
+
+/**
  * Note: directly modified line and has *p_call point directly into
  * modified line
  */
 static int callFromCLCCLine(char *line, RIL_Call *p_call)
 {
-        //+CLCC: 1,0,2,0,0,\"+18005551212\",145
-        //     index,isMT,state,mode,isMpty(,number,TOA)?
+    //+CLCC: 1,0,2,0,0,\"+18005551212\",145,\"\",2,0
+    //     index,isMT,state,mode,isMpty[,<number>,<type>[,<alpha>[,<priority>[,<CLI validity>]]]]
 
     int err;
     int state;
     int mode;
+    char *alpha;
+    int priority;
+    int cliValidity;
 
     err = at_tok_start(&line);
     if (err < 0) goto error;
@@ -312,6 +373,25 @@ static int callFromCLCCLine(char *line, RIL_Call *p_call)
 
         err = at_tok_nextint(&line, &p_call->toa);
         if (err < 0) goto error;
+    }
+
+    if (at_tok_hasmore(&line)) {
+        // alpha is not used yet, simply read and ignore it
+        err = at_tok_nextstr(&line, &alpha);
+        if (err < 0) return 0;
+
+        if (at_tok_hasmore(&line)) {
+            // priority is not used yet, simply read and ignore it
+            err = at_tok_nextint(&line, &priority);
+            if (err < 0) goto error;
+
+            if (at_tok_hasmore(&line)) {
+                err = at_tok_nextint(&line, &cliValidity);
+                if (err < 0) goto error;
+                // mapping CLI validity to numberPresentation based on the definition in ril.h
+                p_call->numberPresentation = convertCliValidity(cliValidity);
+            }
+        }
     }
 
     p_call->uusInfo = NULL;
@@ -435,6 +515,7 @@ static int parseCGCONTRDP(char *line, RIL_Data_Call_Response_v6 *response)
 
     // Assume no error
     response->status = 0;
+    response->active = 2;
     // Assume IP
     response->type = "IP";
 
@@ -718,7 +799,7 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
     int countValidCalls;
     RIL_Call *p_calls;
     RIL_Call **pp_calls;
-    int i;
+    int i, j;
     int needRepoll = 0;
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
@@ -778,7 +859,39 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
             needRepoll = 1;
         }
 
+        // Handle cached CNAP info
+        if (p_calls[countValidCalls].state == RIL_CALL_INCOMING
+            || p_calls[countValidCalls].state == RIL_CALL_WAITING
+        ) {
+            if (strlen(sCnapInfo.name) > 0
+                || (sCnapInfo.CNI_validity > 0 && sCnapInfo.CNI_validity <= 2)) {
+                sCnapInfoList[p_calls[countValidCalls].index - 1] = sCnapInfo;
+                sCnapInfo.name[0] = '\0';
+                sCnapInfo.CNI_validity = 0;
+            }
+        }
+
         countValidCalls++;
+    }
+
+    // Fill up RIL_Call object for name/namePresentation, or clean it.
+    for (i = 0; i < A_MAX_CALL_CONNECTIONS; i++) {
+         if (strlen(sCnapInfoList[i].name) > 0
+             || sCnapInfoList[i].CNI_validity > 0) {
+             for (j = 0; countValidCalls > 0, countValidCalls > j; j++) {
+                 if (p_calls[j].index == i+1) {
+                     p_calls[j].name = sCnapInfoList[i].name;
+                     p_calls[j].namePresentation = sCnapInfoList[i].CNI_validity;
+                     break;
+                 }
+             }
+
+             // no match to current call(s), clear the related CNAP info.
+             if (j >= countValidCalls) {
+                 sCnapInfoList[i].name[0] = '\0';
+                 sCnapInfoList[i].CNI_validity = 0;
+             }
+         }
     }
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
@@ -1466,7 +1579,7 @@ static void requestRegistrationState(int request, void *data,
     char *line;
     int i = 0, j, numElements = 0;
     int count = 3;
-    int type, startfrom;
+    int type;
 
     RLOGD("requestRegistrationState");
     if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
@@ -1501,7 +1614,6 @@ static void requestRegistrationState(int request, void *data,
     if (is3gpp2(type) == 1) {
         RLOGD("registration state type: 3GPP2");
         // TODO: Query modem
-        startfrom = 3;
         if(request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
             asprintf(&responseStr[3], "8");     // EvDo revA
             asprintf(&responseStr[4], "1");     // BSID
@@ -1520,9 +1632,10 @@ static void requestRegistrationState(int request, void *data,
       }
     } else { // type == RADIO_TECH_3GPP
         RLOGD("registration state type: 3GPP");
-        startfrom = 0;
-        asprintf(&responseStr[1], "%x", registration[1]);
-        asprintf(&responseStr[2], "%x", registration[2]);
+        if (registration[1] >= 0)
+            asprintf(&responseStr[1], "%x", registration[1]);
+        if (registration[2] >= 0)
+            asprintf(&responseStr[2], "%x", registration[2]);
         if (count > 3)
             asprintf(&responseStr[3], "%d", registration[3]);
     }
@@ -1538,23 +1651,14 @@ static void requestRegistrationState(int request, void *data,
         // asprintf(&responseStr[5], "1");
     }
 
-    for (j = startfrom; j < numElements; j++) {
-        if (!responseStr[i]) goto error;
-    }
-    free(registration);
-    registration = NULL;
-
     RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, numElements*sizeof(responseStr));
-    for (j = 0; j < numElements; j++ ) {
-        free(responseStr[j]);
-        responseStr[j] = NULL;
-    }
-    free(responseStr);
-    responseStr = NULL;
-    at_response_free(p_response);
+    goto done;
 
-    return;
 error:
+    RLOGE("requestRegistrationState must never return an error when radio is on");
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+
+done:
     if (responseStr) {
         for (j = 0; j < numElements; j++) {
             free(responseStr[j]);
@@ -1563,8 +1667,10 @@ error:
         free(responseStr);
         responseStr = NULL;
     }
-    RLOGE("requestRegistrationState must never return an error when radio is on");
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    if (registration) {
+        free(registration);
+        registration = NULL;
+    }
     at_response_free(p_response);
 }
 
@@ -1986,6 +2092,71 @@ static int deconfigureInterface(const char* ifname)
     return ret;
 }
 
+static int findFreeCid()
+{
+    ATResponse *p_response = NULL;
+    ATLine *p_cur;
+
+    int err, new_cid = -1;
+    int dataStates[s_maxDataContexts];
+    memset( dataStates, 0, s_maxDataContexts * sizeof(int) );
+
+    // Query current active pdp contexts.
+    err = at_send_command_multiline ("AT+CGACT?", "+CGACT:", &p_response);
+    if (err != 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    for (p_cur = p_response->p_intermediates; p_cur != NULL;
+         p_cur = p_cur->p_next) {
+        char *line = p_cur->line;
+        int cid, state;
+
+        err = at_tok_start(&line);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextint(&line, &cid);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextint(&line, &state);
+        if (err < 0)
+            goto error;
+
+        // Found an inactive slot, just reuse cid.
+        if (!state) {
+            new_cid = cid;
+            break;
+        }
+
+        // Error, cid exceeds range of supported PDP contexts.
+        if (cid > s_maxDataContexts) {
+            continue;
+        }
+
+        dataStates[cid - 1] = state;
+    }
+    at_response_free(p_response);
+
+    if (new_cid > -1) {
+        return new_cid;
+    }
+
+    int i;
+    for (i = 0; i < s_maxDataContexts; i++) {
+        if (dataStates[i] == 0) {
+            return i + 1;
+        }
+    }
+
+    return -1;
+
+error:
+    at_response_free(p_response);
+    return -1;
+}
+
 static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 {
     const char *apn;
@@ -2067,7 +2238,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 
     } else {
         RIL_Data_Call_Response_v6 tmp_rp;
-        int ret;
+        int ret, cid;
 
         if (datalen > 6 * sizeof(char *)) {
             pdp_type = ((const char **)data)[6];
@@ -2075,28 +2246,44 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
             pdp_type = "IP";
         }
 
-        asprintf(&cmd, "AT+CGDCONT=1,\"%s\",\"%s\",,0,0", pdp_type, apn);
+        cid = findFreeCid();
+        if (cid < 0) {
+            ALOGE("error: no free cid found.");
+            goto error;
+        }
+
+        asprintf(&cmd, "AT+CGDCONT=%d,\"%s\",\"%s\",,0,0", cid, pdp_type, apn);
         //FIXME check for error here
         err = at_send_command(cmd, NULL);
         free(cmd);
 
         // Set required QoS params to default
-        err = at_send_command("AT+CGQREQ=1", NULL);
+        asprintf(&cmd, "AT+CGQREQ=%d", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // Set minimum QoS params to default
-        err = at_send_command("AT+CGQMIN=1", NULL);
+        asprintf(&cmd, "AT+CGQMIN=%d", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // packet-domain event reporting
         err = at_send_command("AT+CGEREP=1,0", NULL);
 
         // Hangup anything that's happening there now
-        err = at_send_command("AT+CGACT=0,1", NULL);
+        asprintf(&cmd, "AT+CGACT=0,%d", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // Start data on PDP context 1
-        err = at_send_command("ATD*99***1#", NULL);
+        asprintf(&cmd, "ATD*99***%d#", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // Retrieve dynamic properties & setup kernel iface
-        err = at_send_command_singleline("AT+CGCONTRDP=1", "+CGCONTRDP:", &p_response);
+        asprintf(&cmd, "AT+CGCONTRDP=%d", cid);
+        err = at_send_command_singleline(cmd, "+CGCONTRDP:", &p_response);
+        free(cmd);
         if (err < 0 || p_response->success == 0) {
             goto error;
         }
@@ -2111,7 +2298,12 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
             goto error;
         }
 
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &tmp_rp, sizeof(tmp_rp));
+
         freeParsedCGCONTRDP(&tmp_rp);
+        at_response_free(p_response);
+
+        return;
     }
 
     requestOrSendDataCallList(&t);
@@ -2128,8 +2320,8 @@ error:
 static void requestDeactivateDataCall(void *data, size_t datalen, RIL_Token t)
 {
     ATResponse *p_response = NULL;
-    int err;
-    char *cmd, *cid;
+    int err, id;
+    char *cmd, *cid, *ifname;
 
     cid = ((char **)data)[0];
     asprintf(&cmd, "AT+CGACT=0,%s", cid);
@@ -2137,9 +2329,20 @@ static void requestDeactivateDataCall(void *data, size_t datalen, RIL_Token t)
     if (err < 0 || p_response->success == 0) {
         goto error;
     }
+    free(cmd);
 
-    // TODO: Bug 821578: B2G Emulator: Support data call with multiple APN
-    deconfigureInterface("rmnet0");
+    // +CGDCONT=<cid> causes the values for context number <cid> to become
+    // undefined.
+    asprintf(&cmd, "AT+CGDCONT=%s", cid);
+    err = at_send_command(cmd, &p_response);
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    id = atoi(cid) - 1;
+    asprintf(&ifname, "rmnet%d", id);
+    deconfigureInterface(ifname);
+    free(ifname);
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
     at_response_free(p_response);
@@ -2233,66 +2436,144 @@ error:
 
 }
 
+static int getCardLockRetryCount(char* lockType, int32_t* retryCount,
+                                 int32_t* defaultRetryCount)
+{
+    ATResponse* p_response = NULL;
+    int         err;
+    char*       cmd = NULL;
+    char*       line = NULL;
+    char*       type = NULL;
+    int         ret = CME_SUCCESS;
+
+    // Initialize the retryCount;
+    *retryCount = -1;
+    *defaultRetryCount = -1;
+
+    asprintf(&cmd, "AT+CPINR=%s", lockType);
+    err = at_send_command_singleline(cmd, "+CPINR:", &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        ret = at_get_cme_error(p_response);
+        goto done;
+    }
+
+    line = p_response->p_intermediates->line;
+
+    // Parse the AT command result
+    // +CPINR: <code>,<retries>[,<default_retries>]
+    err = at_tok_start(&line);
+    if (err < 0) {
+        goto done;
+    }
+
+    err = at_tok_nextstr(&line, &type);
+    if (err < 0) {
+        goto done;
+    }
+
+    err = at_tok_nextint(&line, retryCount);
+    if (err < 0) {
+        goto done;
+    }
+
+    if (at_tok_hasmore(&line)) {
+        at_tok_nextint(&line, defaultRetryCount);
+    }
+
+done:
+    at_response_free(p_response);
+    return ret;
+}
+
 static void  requestEnterSimPin(void*  data, size_t  datalen, RIL_Token  t)
 {
     ATResponse   *p_response = NULL;
-    int           retries = -1;
     int           err;
     char*         cmd = NULL;
     const char**  strings = (const char**)data;;
 
-    if ( datalen == 2*sizeof(char*) ) {
-        asprintf(&cmd, "AT+CPIN=%s", strings[0]);
-    } else if ( datalen == 3*sizeof(char*) ) {
-        asprintf(&cmd, "AT+CPIN=%s,%s", strings[0], strings[1]);
-    } else
-        goto error;
+    if (getSIMStatus() != SIM_PIN) {
+        int retries = -1;
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, &retries, sizeof(int));
+        return;
+    }
 
+    asprintf(&cmd, "AT+CPIN=%s", strings[0]);
     err = at_send_command_singleline(cmd, "+CPIN:", &p_response);
     free(cmd);
 
     if (err < 0 || p_response->success == 0) {
-        at_response_free(p_response);
-
-        // Get remaining PIN retries
-        char* line = NULL;
-        char* type = NULL;
-
-        asprintf(&cmd, "AT+CPINR=SIM PIN");
-        err = at_send_command_singleline(cmd, "+CPINR:", &p_response);
-        free(cmd);
-
-        if (err < 0 || p_response->success == 0) {
-            goto error;
-        }
-
-        line = p_response->p_intermediates->line;
-        err = at_tok_start(&line);
-
-        if (err < 0) {
-            goto error;
-        }
-
-        err = at_tok_nextstr(&line, &type);
-
-        if (err < 0) {
-            goto error;
-        }
-
-        err = at_tok_nextint(&line, &retries);
-
-        if (err < 0) {
-            retries = -1;
-        }
-error:
-        RIL_onRequestComplete(t, RIL_E_PASSWORD_INCORRECT, &retries, sizeof(int));
+        int retries[2] = {-1, -1};
+        getCardLockRetryCount("SIM PIN", retries+0, retries+1);
+        RIL_onRequestComplete(t, RIL_E_PASSWORD_INCORRECT, &retries[0], sizeof(int));
     } else {
-        retries = 0;
+        int retries = 0;
         RIL_onRequestComplete(t, RIL_E_SUCCESS, &retries, sizeof(int));
     }
+
     at_response_free(p_response);
 }
 
+static void  requestEnterSimPuk(void*  data, size_t  datalen, RIL_Token  t)
+{
+    ATResponse   *p_response = NULL;
+    int           err;
+    char*         cmd = NULL;
+    const char**  strings = (const char**)data;;
+
+    if (getSIMStatus() != SIM_PUK) {
+        int retries = -1;
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, &retries, sizeof(int));
+        return;
+    }
+
+    asprintf(&cmd, "AT+CPIN=%s,%s", strings[0], strings[1]);
+    err = at_send_command_singleline(cmd, "+CPIN:", &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        int retries[2] = {-1, -1};
+        getCardLockRetryCount("SIM PUK", retries+0, retries+1);
+        RIL_onRequestComplete(t, RIL_E_PASSWORD_INCORRECT, &retries[0], sizeof(int));
+    } else {
+        int retries = 0;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &retries, sizeof(int));
+    }
+
+    at_response_free(p_response);
+}
+
+static void  requestChangeSimPin(void*  data, size_t  datalen, RIL_Token  t)
+{
+    ATResponse   *p_response = NULL;
+    int           err;
+    char*         cmd = NULL;
+    const char**  strings = (const char**)data;;
+
+    // Changing pin is only allowed when sim is ready.
+    if (getSIMStatus() != SIM_READY) {
+        int retries = -1;
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, &retries, sizeof(int));
+        return;
+    }
+
+    asprintf(&cmd, "AT+CPIN=%s,%s", strings[0], strings[1]);
+    err = at_send_command_singleline(cmd, "+CPIN:", &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        int retries[2] = {-1, -1};
+        getCardLockRetryCount("SIM PIN", retries+0, retries+1);
+        RIL_onRequestComplete(t, RIL_E_PASSWORD_INCORRECT, &retries[0], sizeof(int));
+    } else {
+        int retries = 0;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &retries, sizeof(int));
+    }
+
+    at_response_free(p_response);
+}
 
 static void  requestSendUSSD(void *data, size_t datalen, RIL_Token t)
 {
@@ -2373,55 +2654,22 @@ static void requestSetSmscAddress(int request, void *data, size_t datalen, RIL_T
 
 static void requestGetUnlockRetryCount(void*  data, size_t  datalen, RIL_Token  t)
 {
-    ATResponse   *p_response = NULL;
-    int           err;
-    char*         cmd = NULL;
     const char**  strings = (const char**)data;
-    char*         line = NULL;
-    char*         type = NULL;
+    int           err;
     int           retries[2];
 
-    if ( datalen == sizeof(char*) ) {
-        asprintf(&cmd, "AT+CPINR=%s", strings[0]);
-    } else
-        goto error;
-
-    err = at_send_command_singleline(cmd, "+CPINR:", &p_response);
-    free(cmd);
-    if (err < 0 || p_response->success == 0) {
-        goto error;
+    if ( datalen != sizeof(char*) ) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
     }
 
-    line = p_response->p_intermediates->line;
-
-    err = at_tok_start(&line);
-    if (err < 0) {
-        goto error;
-    }
-
-    err = at_tok_nextstr(&line, &type);
-    if (err < 0) {
-        goto error;
-    }
-
-    err = at_tok_nextint(&line, retries+0);
-    if (err < 0) {
-        goto error;
-    }
-
-    err = at_tok_nextint(&line, retries+1);
-    if (err < 0) {
-        goto error;
+    err = getCardLockRetryCount(strings[0], retries+0, retries+1);
+    if (err != CME_SUCCESS) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
     }
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, retries, sizeof(retries));
-    at_response_free(p_response);
-
-    return;
-
-error:
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-    at_response_free(p_response);
 }
 
 static void requestScreenState(void* data, size_t datalen, RIL_Token t)
@@ -2517,6 +2765,239 @@ static void requestSetCellInfoListRate(void *data, size_t datalen, RIL_Token t)
     s_cell_info_rate_ms = ((int *)data)[0];
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+}
+
+static void requestQueryCallForwardStatus(void* data, size_t datalen, RIL_Token t)
+{
+    RIL_CallForwardInfo* p_info = (RIL_CallForwardInfo*) data;
+    RIL_CallForwardInfo* p_results = NULL;
+    RIL_CallForwardInfo** pp_results = NULL;
+    ATResponse *p_response = NULL;
+    ATLine* p_cur = NULL;
+    char* cmd = NULL;
+    int i = 0;
+    int count = 0;
+    // 0 means user doesn't input serviceClass. And according to TS 27.007,
+    // the default value of class is 7 (voice, data and fax).
+    int serviceClass = (p_info->serviceClass == 0) ? 7 : p_info->serviceClass;
+
+    // Query call forwarding status.
+    asprintf(&cmd, "AT+CCFC=%d,2,,,%d", p_info->reason, serviceClass);
+    if (at_send_command_multiline(cmd, "+CCFC:", &p_response) < 0 ||
+        at_get_cme_error(p_response) != CME_SUCCESS) {
+        goto error;
+    }
+
+    // Count the call forwarding list
+    for (p_cur = p_response->p_intermediates; p_cur != NULL; p_cur = p_cur->p_next) {
+        count++;
+    }
+
+    // Init the pointer array
+    pp_results = (RIL_CallForwardInfo**) malloc(count * sizeof(RIL_CallForwardInfo*));
+    p_results = (RIL_CallForwardInfo*) malloc(count * sizeof(RIL_CallForwardInfo));
+    memset(p_results, 0, count * sizeof(RIL_CallForwardInfo));
+
+    for (i = 0; i < count; i++) {
+        pp_results[i] = &p_results[i];
+    }
+
+    // Parse the AT command result
+    // +CCFC: <status>,<class1>[,<number>,<type>[,<subaddr>,<satype>[,<time>]]
+    for (i = 0, p_cur = p_response->p_intermediates; p_cur != NULL; p_cur = p_cur->p_next, i++) {
+        char* line = p_cur->line;
+        char* subaddr = NULL;
+        char* satype = NULL;
+
+        p_results[i].reason = p_info->reason;
+
+        if (at_tok_start(&line) < 0) {
+            goto error;
+        }
+
+        // Get <status>
+        if (at_tok_nextint(&line, &p_results[i].status) < 0) {
+            goto error;
+        }
+
+        // Get <class1>
+        if (at_tok_nextint(&line, &p_results[i].serviceClass) < 0) {
+            goto error;
+        }
+
+        if (!at_tok_hasmore(&line)) {
+            continue;
+        }
+
+        // Get <number>
+        if (at_tok_nextstr(&line, &p_results[i].number) < 0) {
+            goto error;
+        }
+
+        // Get <type>
+        if (at_tok_nextint(&line, &p_results[i].toa) < 0) {
+            goto error;
+        }
+
+        if (!at_tok_hasmore(&line)) {
+            continue;
+        }
+
+        // Get <subaddr>
+        if (at_tok_nextstr(&line, &subaddr) < 0) {
+            goto error;
+        }
+
+        // Get <satype>
+        if (at_tok_nextstr(&line, &satype) < 0) {
+            goto error;
+        }
+
+        if (!at_tok_hasmore(&line)) {
+            continue;
+        }
+
+        // Get <time>
+        if (at_tok_nextint(&line, &p_results[i].timeSeconds) < 0) {
+            goto error;
+        }
+    }
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, pp_results, count * sizeof(RIL_CallForwardInfo*));
+    goto done;
+
+error:
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+
+done:
+    at_response_free(p_response);
+    free(pp_results);
+    free(p_results);
+    free(cmd);
+}
+
+static void requestSetCallForward(void* data, size_t datalen, RIL_Token t)
+{
+    // Modem command for call forwarding status
+    RIL_CallForwardInfo* p_info = (RIL_CallForwardInfo*) data;
+    ATResponse *p_response = NULL;
+    char* cmd = NULL;
+
+    switch (p_info->status) {
+        case 0: /* disable */
+        case 1: /* enable  */
+        case 3: /* registeration */
+        case 4: /* erasure */
+            asprintf(&cmd, "AT+CCFC=%d,%d,\"%s\",%d,%d,,,%d", p_info->reason
+                                                            , p_info->status
+                                                            , p_info->number
+                                                            , p_info->toa
+                                                            , p_info->serviceClass
+                                                            , p_info->timeSeconds);
+            break;
+
+        default:
+            goto error;
+    }
+
+    if (at_send_command(cmd, &p_response) < 0 ||
+        at_get_cme_error(p_response) != CME_SUCCESS) {
+        goto error;
+    }
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    goto done;
+
+error:
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+
+done:
+    free(cmd);
+    at_response_free(p_response);
+}
+
+static void requestQueryFacilityLock(void* data, size_t datalen, RIL_Token t)
+{
+    ATResponse   *p_response = NULL;
+    ATLine       *p_cur;
+    int           err;
+    char*         cmd = NULL;
+    const char**  strings = (const char**)data;
+    int           serviceClass = 0;
+
+    // Query facility lock. AT+CLCK=<fac>,<mode>[,<password>[,<class>]]
+    asprintf(&cmd, "AT+CLCK=\"%s\",2,\"%s\",%d", strings[0], strings[1], atoi(strings[2]));
+    err = at_send_command_multiline(cmd, "+CLCK:", &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    // Parse the AT command result. +CLCK: <status>[,<class>]
+    for (p_cur = p_response->p_intermediates; p_cur != NULL;
+         p_cur = p_cur->p_next) {
+        char *line = p_cur->line;
+        int status;
+        int class;
+
+        err = at_tok_start(&line);
+        if (err < 0) {
+            goto error;
+        }
+
+        // Get <status>
+        if (at_tok_nextint(&line, &status) < 0) {
+            goto error;
+        }
+
+        if (!at_tok_hasmore(&line)) {
+            continue;
+        }
+
+        // Get <class>
+        if (at_tok_nextint(&line, &class) < 0) {
+            goto error;
+        }
+
+        if (status == 1) {
+            serviceClass |= class;
+        }
+    }
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &serviceClass, sizeof(serviceClass));
+    goto done;
+
+error:
+    RIL_onRequestComplete(t, cmeErrorToRilError(at_get_cme_error(p_response)), NULL, 0);
+
+done:
+    at_response_free(p_response);
+}
+
+static void requestSetFacilityLock(void* data, size_t datalen, RIL_Token t)
+{
+    ATResponse   *p_response = NULL;
+    int           err;
+    char*         cmd = NULL;
+    const char**  strings = (const char**)data;
+
+    // Set facility lock. AT+CLCK=<fac>,<mode>[,<password>[,<class>]]
+    asprintf(&cmd, "AT+CLCK=\"%s\",%d,\"%s\",%d", strings[0], atoi(strings[1]),
+             strings[2], atoi(strings[3]));
+    err = at_send_command(cmd, &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        int retries[2] = {-1, -1};
+        getCardLockRetryCount("SIM PIN", retries+0, retries+1);
+        RIL_onRequestComplete(t, cmeErrorToRilError(at_get_cme_error(p_response)), &retries[0], sizeof(int));
+    } else {
+        int retries = 0;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &retries, sizeof(int));
+    }
+
+    at_response_free(p_response);
 }
 
 /*** Callback methods from the RIL library to us ***/
@@ -2882,12 +3363,23 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         }
 
         case RIL_REQUEST_ENTER_SIM_PIN:
+            requestEnterSimPin(data, datalen, t);
+            pollSIMState(NULL);
+            break;
+
         case RIL_REQUEST_ENTER_SIM_PUK:
+            requestEnterSimPuk(data, datalen, t);
+            pollSIMState(NULL);
+            break;
+
+        case RIL_REQUEST_CHANGE_SIM_PIN:
+            requestChangeSimPin(data, datalen, t);
+            break;
+
         case RIL_REQUEST_ENTER_SIM_PIN2:
         case RIL_REQUEST_ENTER_SIM_PUK2:
-        case RIL_REQUEST_CHANGE_SIM_PIN:
         case RIL_REQUEST_CHANGE_SIM_PIN2:
-            requestEnterSimPin(data, datalen, t);
+            // We don't support pin2 and puk2 in qemu currently.
             break;
 
         case RIL_REQUEST_IMS_REGISTRATION_STATE: {
@@ -2936,6 +3428,22 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             requestGetPreferredNetworkType(request, data, datalen, t);
             break;
 
+        case RIL_REQUEST_GET_SMSC_ADDRESS:
+            requestGetSmscAddress(request, data, datalen, t);
+            break;
+
+        case RIL_REQUEST_SET_SMSC_ADDRESS:
+            requestSetSmscAddress(request, data, datalen, t);
+            break;
+
+        case RIL_REQUEST_QUERY_CALL_FORWARD_STATUS:
+            requestQueryCallForwardStatus(data, datalen, t);
+            break;
+
+        case RIL_REQUEST_SET_CALL_FORWARD:
+            requestSetCallForward(data, datalen, t);
+            break;
+
         case RIL_REQUEST_GET_CELL_INFO_LIST:
             requestGetCellInfoList(data, datalen, t);
             break;
@@ -2944,12 +3452,12 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             requestSetCellInfoListRate(data, datalen, t);
             break;
 
-        case RIL_REQUEST_GET_SMSC_ADDRESS:
-            requestGetSmscAddress(request, data, datalen, t);
+        case RIL_REQUEST_QUERY_FACILITY_LOCK:
+            requestQueryFacilityLock(data, datalen, t);
             break;
 
-        case RIL_REQUEST_SET_SMSC_ADDRESS:
-            requestSetSmscAddress(request, data, datalen, t);
+        case RIL_REQUEST_SET_FACILITY_LOCK:
+            requestSetFacilityLock(data, datalen, t);
             break;
 
         default:
@@ -3335,7 +3843,7 @@ static void pollSIMState (void *param)
     ATResponse *p_response;
     int ret;
 
-    if (sState != RADIO_STATE_SIM_NOT_READY) {
+    if (sState != RADIO_STATE_ON) {
         // no longer valid to poll
         return;
     }
@@ -3558,6 +4066,48 @@ static void probeForModemMode(ModemInfo *info)
     RLOGI("Found GSM Modem");
 }
 
+static void queryNumOfDataContexts()
+{
+    ATResponse *p_response;
+    ATLine *p_cur;
+    int err;
+
+    // +CGDCONT=? is used to query the ranges of supported PDP Contexts.
+    err = at_send_command_multiline("AT+CGDCONT=?", "+CGDCONT:", &p_response);
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    for (p_cur = p_response->p_intermediates; p_cur != NULL;
+         p_cur = p_cur->p_next) {
+        char *line = p_cur->line;
+        char *range;
+        int start, end;
+
+        err = at_tok_start(&line);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextstr(&line, &range);
+        if (err < 0)
+            goto error;
+
+        sscanf(range, "(%d-%d)", &start, &end);
+        // Assign to s_maxDataContexts the maximum range found.
+        if (end > s_maxDataContexts) {
+            s_maxDataContexts = end;
+        }
+    }
+    ALOGI("Number of data contexts: %d", s_maxDataContexts);
+
+    at_response_free(p_response);
+    return;
+
+error:
+    ALOGE("Error getting number of data contexts.");
+    at_response_free(p_response);
+}
+
 /**
  * Initialize everything that can be configured while we're still in
  * AT+CFUN=0
@@ -3572,6 +4122,9 @@ static void initializeCallback(void *param)
     at_handshake();
 
     probeForModemMode(sMdmInfo);
+
+    queryNumOfDataContexts();
+
     /* note: we don't check errors here. Everything important will
        be handled in onATTimeout and onATReaderClosed */
 
@@ -3881,6 +4434,42 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         }
         free(line);
         RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, &response, sizeof(response));
+    } else if (strStartsWith(s, "+CNAP:")) {
+        char* name = NULL;
+        int namePresentation = 0;
+        int len = 0;
+        line = p = strdup(s);
+        if (!line) {
+            ALOGE("+CNAP: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextstr(&p, &name) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextint(&p, &namePresentation) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+
+        if (sCnapInfo.CNI_validity == 0) {
+          len  = strlen(name);
+          if (len >= A_CALL_NAME_MAX_SIZE) {
+            len = A_CALL_NAME_MAX_SIZE-1;
+          }
+          strncpy(sCnapInfo.name, name, len);
+        }
+        sCnapInfo.name[len] = '\0';
+        sCnapInfo.CNI_validity = namePresentation;
+
+        free(line);
     }
 }
 
