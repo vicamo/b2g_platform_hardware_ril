@@ -309,24 +309,13 @@ static int decodeCdmaSubscriptionSource (RIL_RadioState radioState);
 static RIL_RadioState processRadioState(RIL_RadioState newRadioState);
 
 #ifdef RIL_SHLIB
-#if defined(ANDROID_MULTI_SIM)
 extern "C" void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
                                 size_t datalen, RIL_SOCKET_ID socket_id);
-#else
-extern "C" void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
-                                size_t datalen);
-#endif
 #endif
 
-#if defined(ANDROID_MULTI_SIM)
 #define RIL_UNSOL_RESPONSE(a, b, c, d) RIL_onUnsolicitedResponse((a), (b), (c), (d))
 #define CALL_ONREQUEST(a, b, c, d, e) s_callbacks.onRequest((a), (b), (c), (d), (e))
 #define CALL_ONSTATEREQUEST(a) s_callbacks.onStateRequest(a)
-#else
-#define RIL_UNSOL_RESPONSE(a, b, c, d) RIL_onUnsolicitedResponse((a), (b), (c))
-#define CALL_ONREQUEST(a, b, c, d, e) s_callbacks.onRequest((a), (b), (c), (d))
-#define CALL_ONSTATEREQUEST(a) s_callbacks.onStateRequest()
-#endif
 
 static UserCallbackInfo * internalRequestTimedCallback
     (RIL_TimedCallback callback, void *param,
@@ -4306,26 +4295,16 @@ processRadioState(RIL_RadioState newRadioState, RIL_SOCKET_ID socket_id) {
 }
 
 
-#if defined(ANDROID_MULTI_SIM)
 extern "C"
 void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
                                 size_t datalen, RIL_SOCKET_ID socket_id)
-#else
-extern "C"
-void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
-                                size_t datalen)
-#endif
 {
     int unsolResponseIndex;
     int ret;
     int64_t timeReceived = 0;
     bool shouldScheduleTimeout = false;
     RIL_RadioState newState;
-    RIL_SOCKET_ID soc_id = RIL_SOCKET_1;
-
-#if defined(ANDROID_MULTI_SIM)
-    soc_id = socket_id;
-#endif
+    RIL_SOCKET_ID soc_id = socket_id;
 
 
     if (s_registerCalled == 0) {
