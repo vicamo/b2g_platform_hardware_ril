@@ -1064,7 +1064,7 @@ static void requestConference(RIL_Token t)
     return;
 error:
     at_response_free(p_response);
-    ALOGE("requestConference error!");
+    RLOGE("requestConference error!");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
@@ -1092,7 +1092,7 @@ static void requestSeparateConnection(void *data, size_t datalen, RIL_Token t)
     return;
 error:
     at_response_free(p_response);
-    ALOGE("requestSeparateConnection error!");
+    RLOGE("requestSeparateConnection error!");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
@@ -1169,7 +1169,7 @@ static void requestSetPreferredNetworkType( int request, void *data,
     }
 
     preferred = net2pmask[value];
-    ALOGD("requestSetPreferredNetworkType: current: %x. New: %x", PREFERRED_NETWORK(sMdmInfo), preferred);
+    RLOGD("requestSetPreferredNetworkType: current: %x. New: %x", PREFERRED_NETWORK(sMdmInfo), preferred);
 
     if (query_ctec(sMdmInfo, &current, NULL) < 0) {
         RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
@@ -2186,7 +2186,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 
         cid = findFreeCid();
         if (cid < 0) {
-            ALOGE("error: no free cid found.");
+            RLOGE("error: no free cid found.");
             goto error;
         }
 
@@ -4089,13 +4089,13 @@ static void queryNumOfDataContexts()
             s_maxDataContexts = end;
         }
     }
-    ALOGI("Number of data contexts: %d", s_maxDataContexts);
+    RLOGI("Number of data contexts: %d", s_maxDataContexts);
 
     at_response_free(p_response);
     return;
 
 error:
-    ALOGE("Error getting number of data contexts.");
+    RLOGE("Error getting number of data contexts.");
     at_response_free(p_response);
 }
 
@@ -4397,16 +4397,16 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         int state = -1;
         line = p = strdup(s);
         if (!line) {
-            ALOGE("+CFUN: Unable to allocate memory");
+            RLOGE("+CFUN: Unable to allocate memory");
             return;
         }
         if (at_tok_start(&p) < 0) {
-            ALOGE("invalid +CFUN response: %s", s);
+            RLOGE("invalid +CFUN response: %s", s);
             free(line);
             return;
         }
         if (at_tok_nextint(&p, &state) < 0) {
-            ALOGE("invalid +CFUN response: %s", s);
+            RLOGE("invalid +CFUN response: %s", s);
             free(line);
             return;
         }
@@ -4419,18 +4419,18 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
                 setRadioState(RADIO_STATE_ON);
                 break;
             default:
-                ALOGE("invalid +CFUN response: %s", s);
+                RLOGE("invalid +CFUN response: %s", s);
                 return;
         }
     } else if (strStartsWith(s, "+CSQ:")) {
         RIL_SignalStrength_v6 response;
         line = p = strdup(s);
         if (!line) {
-            ALOGE("+CSQ: Unable to allocate memory");
+            RLOGE("+CSQ: Unable to allocate memory");
             return;
         }
         if (at_tok_start(&p) < 0) {
-            ALOGE("invalid +CSQ response: %s", s);
+            RLOGE("invalid +CSQ response: %s", s);
             free(line);
             return;
         }
@@ -4446,21 +4446,21 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         int len = 0;
         line = p = strdup(s);
         if (!line) {
-            ALOGE("+CNAP: Unable to allocate memory");
+            RLOGE("+CNAP: Unable to allocate memory");
             return;
         }
         if (at_tok_start(&p) < 0) {
-            ALOGE("invalid +CNAP response: %s", s);
+            RLOGE("invalid +CNAP response: %s", s);
             free(line);
             return;
         }
         if (at_tok_nextstr(&p, &name) < 0) {
-            ALOGE("invalid +CNAP response: %s", s);
+            RLOGE("invalid +CNAP response: %s", s);
             free(line);
             return;
         }
         if (at_tok_nextint(&p, &namePresentation) < 0) {
-            ALOGE("invalid +CNAP response: %s", s);
+            RLOGE("invalid +CNAP response: %s", s);
             free(line);
             return;
         }
