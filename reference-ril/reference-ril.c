@@ -18,6 +18,7 @@
 #include <telephony/ril_cdma_sms.h>
 #include <telephony/librilutils.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <assert.h>
 #include <string.h>
 #include <errno.h>
@@ -34,6 +35,7 @@
 #include <getopt.h>
 #include <sys/socket.h>
 #include <cutils/sockets.h>
+#include <netutils/ifc.h>
 #include <termios.h>
 #include <sys/system_properties.h>
 #include <regex.h>
@@ -48,9 +50,6 @@ static void *noopRemoveWarning( void *a ) { return a; }
 #define RIL_UNUSED_PARM(a) noopRemoveWarning((void *)&(a));
 
 #define MAX_AT_RESPONSE 0x1000
-
-/* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
-#define PPP_TTY_PATH "eth0"
 
 // Default MTU value
 #define DEFAULT_MTU 1500
@@ -247,6 +246,28 @@ static int s_mnc = 0;
 static int s_lac = 0;
 static int s_cid = 0;
 
+/* TS 24.096 clause 4.1 */
+#define  A_CALL_NAME_MAX_SIZE  80
+/* According to 3GPP 22.083 clause 2.2.1, 3GPP 22.084 clause 1.2.1 and 3GPP
+ * 22.030 clause 6.5.5.6, the case of the maximum number is reached "when
+ * there comes an incoming call while we have already one active(held)
+ * conference call (with 5 remote parties) and one held(active) single call."
+ * The maximum number of voice calls is therefore 7.
+ */
+#define  A_MAX_CALL_CONNECTIONS  7
+
+static int s_maxDataContexts = 0;
+
+typedef struct {
+    char name[ A_CALL_NAME_MAX_SIZE+1 ];
+    int CNI_validity;
+} CnapInfo;
+
+// Temporary variable to hold +CNAP information, cleaned after requestGetCurrentCalls.
+static CnapInfo sCnapInfo = {'\0', 0};
+// CnapInfoList to hold information associated with call id.
+static CnapInfo sCnapInfoList[ A_MAX_CALL_CONNECTIONS ];
+
 static void pollSIMState (void *param);
 static void setRadioState(RIL_RadioState newState);
 static void setRadioTechnology(ModemInfo *mdm, int newtech);
@@ -269,17 +290,41 @@ static int clccStateToRILState(int state, RIL_CallState *p_state)
 }
 
 /**
+ * Convert CLI Validity to number presenstaion.
+ *
+ * CLI validity is ranged between 0 and 4 defined in TS 27.007 Clause 7.18,
+ * and numberPresentation is ranged between 0 and 3 defined in ril.h.
+ */
+static int convertCliValidity(int cliValidity) {
+    int presentation = 0;
+    if (cliValidity <= 0 || cliValidity > 4) {
+        return presentation;
+    }
+
+    if (cliValidity == 2 || cliValidity == 4) {
+        presentation = 2;
+    } else {
+        presentation = cliValidity;
+    }
+
+    return presentation;
+}
+
+/**
  * Note: directly modified line and has *p_call point directly into
  * modified line
  */
 static int callFromCLCCLine(char *line, RIL_Call *p_call)
 {
-        //+CLCC: 1,0,2,0,0,\"+18005551212\",145
-        //     index,isMT,state,mode,isMpty(,number,TOA)?
+    //+CLCC: 1,0,2,0,0,\"+18005551212\",145,\"\",2,0
+    //     index,isMT,state,mode,isMpty[,<number>,<type>[,<alpha>[,<priority>[,<CLI validity>]]]]
 
     int err;
     int state;
     int mode;
+    char *alpha;
+    int priority;
+    int cliValidity;
 
     err = at_tok_start(&line);
     if (err < 0) goto error;
@@ -320,6 +365,25 @@ static int callFromCLCCLine(char *line, RIL_Call *p_call)
 
         err = at_tok_nextint(&line, &p_call->toa);
         if (err < 0) goto error;
+    }
+
+    if (at_tok_hasmore(&line)) {
+        // alpha is not used yet, simply read and ignore it
+        err = at_tok_nextstr(&line, &alpha);
+        if (err < 0) return 0;
+
+        if (at_tok_hasmore(&line)) {
+            // priority is not used yet, simply read and ignore it
+            err = at_tok_nextint(&line, &priority);
+            if (err < 0) goto error;
+
+            if (at_tok_hasmore(&line)) {
+                err = at_tok_nextint(&line, &cliValidity);
+                if (err < 0) goto error;
+                // mapping CLI validity to numberPresentation based on the definition in ril.h
+                p_call->numberPresentation = convertCliValidity(cliValidity);
+            }
+        }
     }
 
     p_call->uusInfo = NULL;
@@ -432,6 +496,101 @@ static void requestDataCallList(void *data __unused, size_t datalen __unused, RI
     requestOrSendDataCallList(&t);
 }
 
+static void freeParsedCGCONTRDP(RIL_Data_Call_Response_v11 *response)
+{
+    response->type = NULL;
+    free(response->ifname);
+    response->ifname = NULL;
+    free(response->addresses);
+    response->addresses = NULL;
+    free(response->gateways);
+    response->gateways = NULL;
+    free(response->dnses);
+    response->dnses = NULL;
+}
+
+static int parseCGCONTRDP(char *line, RIL_Data_Call_Response_v11 *response)
+{
+    int err, bearer_id;
+    char *str, *dns1, *dns2;
+
+    err = at_tok_start(&line);
+    if (err < 0)
+        goto error;
+
+    err = at_tok_nextint(&line, &response->cid);
+    if (err < 0)
+        goto error;
+
+    // Assume no error
+    response->status = 0;
+    response->active = 2;
+    // Assume IP
+    response->type = "IP";
+
+    // bearer_id
+    err = at_tok_nextint(&line, &bearer_id);
+    if (err < 0)
+        goto error;
+
+    asprintf(&response->ifname, "rmnet%d", bearer_id);
+
+    // APN ignored for v5
+    err = at_tok_nextstr(&line, &str);
+    if (err < 0)
+        goto error;
+
+    // local_addr and subnet_mask
+    if (!at_tok_hasmore(&line)) {
+        return 0;
+    }
+
+    // With "AT+CGPIAF=1,1,0,1" assume "a1.a2.a3.a4/mask" for IPv4 and
+    // "a1:a2:a3:a4:a5:a6:a7:a8/mask" for IPv6.  Assume IPv4 for now.
+    err = at_tok_nextstr(&line, &str);
+    if (err < 0)
+        goto error;
+
+    response->addresses = strdup(str);
+
+    // gw
+    if (!at_tok_hasmore(&line)) {
+        return 0;
+    }
+
+    err = at_tok_nextstr(&line, &str);
+    if (err < 0)
+        goto error;
+
+    response->gateways = strdup(str);
+
+    // dns_prim
+    if (!at_tok_hasmore(&line)) {
+        return 0;
+    }
+
+    err = at_tok_nextstr(&line, &dns1);
+    if (err < 0)
+        goto error;
+
+    // dns_sec
+    if (at_tok_hasmore(&line)) {
+        err = at_tok_nextstr(&line, &dns2);
+        if (err < 0)
+            goto error;
+
+        asprintf(&response->dnses, "%s %s", dns1, dns2);
+    } else {
+        response->dnses = strdup(dns1);
+    }
+
+    return 0;
+
+error:
+    freeParsedCGCONTRDP(response);
+    return -1;
+}
+
 static void requestOrSendDataCallList(RIL_Token *t)
 {
     ATResponse *p_response;
@@ -456,6 +615,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
 
     RIL_Data_Call_Response_v11 *responses =
         alloca(n * sizeof(RIL_Data_Call_Response_v11));
+    RIL_Data_Call_Response_v11 tmp_rp;
 
     int i;
     for (i = 0; i < n; i++) {
@@ -494,7 +654,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
 
     at_response_free(p_response);
 
-    err = at_send_command_multiline ("AT+CGDCONT?", "+CGDCONT:", &p_response);
+    err = at_send_command_multiline ("AT+CGCONTRDP", "+CGCONTRDP:", &p_response);
     if (err != 0 || p_response->success == 0) {
         if (t != NULL)
             RIL_onRequestComplete(*t, RIL_E_GENERIC_FAILURE, NULL, 0);
@@ -506,99 +666,45 @@ static void requestOrSendDataCallList(RIL_Token *t)
 
     for (p_cur = p_response->p_intermediates; p_cur != NULL;
          p_cur = p_cur->p_next) {
-        char *line = p_cur->line;
-        int cid;
-
-        err = at_tok_start(&line);
-        if (err < 0)
-            goto error;
-
-        err = at_tok_nextint(&line, &cid);
-        if (err < 0)
+        if (parseCGCONTRDP(p_cur->line, &tmp_rp) < 0)
             goto error;
 
         for (i = 0; i < n; i++) {
-            if (responses[i].cid == cid)
+            if (responses[i].cid == tmp_rp.cid)
                 break;
         }
 
         if (i >= n) {
             /* details for a context we didn't hear about in the last request */
+            freeParsedCGCONTRDP(&tmp_rp);
             continue;
         }
 
-        // Assume no error
-        responses[i].status = 0;
+        responses[i].status = tmp_rp.status;
+        responses[i].type = tmp_rp.type;
+        responses[i].mtu = DEFAULT_MTU;
 
-        // type
-        err = at_tok_nextstr(&line, &out);
-        if (err < 0)
-            goto error;
-        responses[i].type = alloca(strlen(out) + 1);
-        strcpy(responses[i].type, out);
+#define COPY_FIELD(f) \
+    responses[i].f = alloca(strlen(tmp_rp.f) + 1); \
+    strcpy(responses[i].f, tmp_rp.f);
 
-        // APN ignored for v5
-        err = at_tok_nextstr(&line, &out);
-        if (err < 0)
-            goto error;
+        COPY_FIELD(ifname);
 
-        responses[i].ifname = alloca(strlen(PPP_TTY_PATH) + 1);
-        strcpy(responses[i].ifname, PPP_TTY_PATH);
+        if (tmp_rp.addresses) {
+            COPY_FIELD(addresses);
 
-        err = at_tok_nextstr(&line, &out);
-        if (err < 0)
-            goto error;
+            if (tmp_rp.gateways) {
+                COPY_FIELD(gateways);
 
-        responses[i].addresses = alloca(strlen(out) + 1);
-        strcpy(responses[i].addresses, out);
-
-        {
-            char  propValue[PROP_VALUE_MAX];
-
-            if (__system_property_get("ro.kernel.qemu", propValue) != 0) {
-                /* We are in the emulator - the dns servers are listed
-                 * by the following system properties, setup in
-                 * /system/etc/init.goldfish.sh:
-                 *  - net.eth0.dns1
-                 *  - net.eth0.dns2
-                 *  - net.eth0.dns3
-                 *  - net.eth0.dns4
-                 */
-                const int   dnslist_sz = 128;
-                char*       dnslist = alloca(dnslist_sz);
-                const char* separator = "";
-                int         nn;
-
-                dnslist[0] = 0;
-                for (nn = 1; nn <= 4; nn++) {
-                    /* Probe net.eth0.dns<n> */
-                    char  propName[PROP_NAME_MAX];
-                    snprintf(propName, sizeof propName, "net.eth0.dns%d", nn);
-
-                    /* Ignore if undefined */
-                    if (__system_property_get(propName, propValue) == 0) {
-                        continue;
-                    }
-
-                    /* Append the DNS IP address */
-                    strlcat(dnslist, separator, dnslist_sz);
-                    strlcat(dnslist, propValue, dnslist_sz);
-                    separator = " ";
+                if (tmp_rp.dnses) {
+                    COPY_FIELD(dnses);
                 }
-                responses[i].dnses = dnslist;
-
-                /* There is only on gateway in the emulator */
-                responses[i].gateways = "10.0.2.2";
-                responses[i].mtu = DEFAULT_MTU;
-            }
-            else {
-                /* I don't know where we are, so use the public Google DNS
-                 * servers by default and no gateway.
-                 */
-                responses[i].dnses = "8.8.8.8 8.8.4.4";
-                responses[i].gateways = "";
             }
         }
+
+#undef COPY_FIELD
+
+        freeParsedCGCONTRDP(&tmp_rp);
     }
 
     at_response_free(p_response);
@@ -705,7 +811,7 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
     int countValidCalls;
     RIL_Call *p_calls;
     RIL_Call **pp_calls;
-    int i;
+    int i, j;
     int needRepoll = 0;
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
@@ -765,7 +871,39 @@ static void requestGetCurrentCalls(void *data __unused, size_t datalen __unused,
             needRepoll = 1;
         }
 
+        // Handle cached CNAP info
+        if (p_calls[countValidCalls].state == RIL_CALL_INCOMING
+            || p_calls[countValidCalls].state == RIL_CALL_WAITING
+        ) {
+            if (strlen(sCnapInfo.name) > 0
+                || (sCnapInfo.CNI_validity > 0 && sCnapInfo.CNI_validity <= 2)) {
+                sCnapInfoList[p_calls[countValidCalls].index - 1] = sCnapInfo;
+                sCnapInfo.name[0] = '\0';
+                sCnapInfo.CNI_validity = 0;
+            }
+        }
+
         countValidCalls++;
+    }
+
+    // Fill up RIL_Call object for name/namePresentation, or clean it.
+    for (i = 0; i < A_MAX_CALL_CONNECTIONS; i++) {
+         if (strlen(sCnapInfoList[i].name) > 0
+             || sCnapInfoList[i].CNI_validity > 0) {
+             for (j = 0; countValidCalls > 0, countValidCalls > j; j++) {
+                 if (p_calls[j].index == i+1) {
+                     p_calls[j].name = sCnapInfoList[i].name;
+                     p_calls[j].namePresentation = sCnapInfoList[i].CNI_validity;
+                     break;
+                 }
+             }
+
+             // no match to current call(s), clear the related CNAP info.
+             if (j >= countValidCalls) {
+                 sCnapInfoList[i].name[0] = '\0';
+                 sCnapInfoList[i].CNI_validity = 0;
+             }
+         }
     }
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
@@ -1453,7 +1591,7 @@ static void requestRegistrationState(int request, void *data __unused,
     char *line;
     int i = 0, j, numElements = 0;
     int count = 3;
-    int type, startfrom;
+    int type;
 
     RLOGD("requestRegistrationState");
     if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
@@ -1488,7 +1626,6 @@ static void requestRegistrationState(int request, void *data __unused,
     if (is3gpp2(type) == 1) {
         RLOGD("registration state type: 3GPP2");
         // TODO: Query modem
-        startfrom = 3;
         if(request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
             asprintf(&responseStr[3], "8");     // EvDo revA
             asprintf(&responseStr[4], "1");     // BSID
@@ -1507,9 +1644,10 @@ static void requestRegistrationState(int request, void *data __unused,
       }
     } else { // type == RADIO_TECH_3GPP
         RLOGD("registration state type: 3GPP");
-        startfrom = 0;
-        asprintf(&responseStr[1], "%x", registration[1]);
-        asprintf(&responseStr[2], "%x", registration[2]);
+        if (registration[1] >= 0)
+            asprintf(&responseStr[1], "%x", registration[1]);
+        if (registration[2] >= 0)
+            asprintf(&responseStr[2], "%x", registration[2]);
         if (count > 3)
             asprintf(&responseStr[3], "%d", registration[3]);
     }
@@ -1525,23 +1663,14 @@ static void requestRegistrationState(int request, void *data __unused,
         // asprintf(&responseStr[5], "1");
     }
 
-    for (j = startfrom; j < numElements; j++) {
-        if (!responseStr[i]) goto error;
-    }
-    free(registration);
-    registration = NULL;
-
     RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, numElements*sizeof(responseStr));
-    for (j = 0; j < numElements; j++ ) {
-        free(responseStr[j]);
-        responseStr[j] = NULL;
-    }
-    free(responseStr);
-    responseStr = NULL;
-    at_response_free(p_response);
+    goto done;
 
-    return;
 error:
+    RLOGE("requestRegistrationState must never return an error when radio is on");
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+
+done:
     if (responseStr) {
         for (j = 0; j < numElements; j++) {
             free(responseStr[j]);
@@ -1550,8 +1679,10 @@ error:
         free(responseStr);
         responseStr = NULL;
     }
-    RLOGE("requestRegistrationState must never return an error when radio is on");
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    if (registration) {
+        free(registration);
+        registration = NULL;
+    }
     at_response_free(p_response);
 }
 
@@ -1936,6 +2067,108 @@ error2:
     RIL_onRequestComplete(t, RIL_E_SMS_SEND_FAIL_RETRY, &response, sizeof(response));
 }
 
+static int configureInterface(const char* ifname, const char *addr)
+{
+    char ip[16];
+    int prefixLen, ret = -1;
+
+    if (2 != sscanf(addr, "%[.0-9]/%d", ip, &prefixLen))
+        return ret;
+
+    if (ifc_init())
+        return ret;
+
+    if (!ifc_up(ifname)) {
+        if (ifc_set_addr(ifname, inet_addr(ip)) ||
+            ifc_set_prefixLength(ifname, prefixLen)) {
+            ifc_down(ifname);
+        } else {
+            ret = 0;
+        }
+    }
+
+    ifc_close();
+
+    return ret;
+}
+
+static int deconfigureInterface(const char* ifname)
+{
+    int ret;
+
+    if (ifc_init())
+        return -1;
+
+    ret = ifc_down(ifname);
+    ifc_close();
+    return ret;
+}
+
+static int findFreeCid()
+{
+    ATResponse *p_response = NULL;
+    ATLine *p_cur;
+
+    int err, new_cid = -1;
+    int dataStates[s_maxDataContexts];
+    memset( dataStates, 0, s_maxDataContexts * sizeof(int) );
+
+    // Query current active pdp contexts.
+    err = at_send_command_multiline ("AT+CGACT?", "+CGACT:", &p_response);
+    if (err != 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    for (p_cur = p_response->p_intermediates; p_cur != NULL;
+         p_cur = p_cur->p_next) {
+        char *line = p_cur->line;
+        int cid, state;
+
+        err = at_tok_start(&line);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextint(&line, &cid);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextint(&line, &state);
+        if (err < 0)
+            goto error;
+
+        // Found an inactive slot, just reuse cid.
+        if (!state) {
+            new_cid = cid;
+            break;
+        }
+
+        // Error, cid exceeds range of supported PDP contexts.
+        if (cid > s_maxDataContexts) {
+            continue;
+        }
+
+        dataStates[cid - 1] = state;
+    }
+    at_response_free(p_response);
+
+    if (new_cid > -1) {
+        return new_cid;
+    }
+
+    int i;
+    for (i = 0; i < s_maxDataContexts; i++) {
+        if (dataStates[i] == 0) {
+            return i + 1;
+        }
+    }
+
+    return -1;
+
+error:
+    at_response_free(p_response);
+    return -1;
+}
+
 static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 {
     const char *apn;
@@ -2016,6 +2249,8 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
         if (qmistatus < 0) goto error;
 
     } else {
+        RIL_Data_Call_Response_v11 tmp_rp;
+        int ret, cid;
 
         if (datalen > 6 * sizeof(char *)) {
             pdp_type = ((const char **)data)[6];
@@ -2023,29 +2258,64 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
             pdp_type = "IP";
         }
 
-        asprintf(&cmd, "AT+CGDCONT=1,\"%s\",\"%s\",,0,0", pdp_type, apn);
+        cid = findFreeCid();
+        if (cid < 0) {
+            ALOGE("error: no free cid found.");
+            goto error;
+        }
+
+        asprintf(&cmd, "AT+CGDCONT=%d,\"%s\",\"%s\",,0,0", cid, pdp_type, apn);
         //FIXME check for error here
         err = at_send_command(cmd, NULL);
         free(cmd);
 
         // Set required QoS params to default
-        err = at_send_command("AT+CGQREQ=1", NULL);
+        asprintf(&cmd, "AT+CGQREQ=%d", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // Set minimum QoS params to default
-        err = at_send_command("AT+CGQMIN=1", NULL);
+        asprintf(&cmd, "AT+CGQMIN=%d", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // packet-domain event reporting
         err = at_send_command("AT+CGEREP=1,0", NULL);
 
         // Hangup anything that's happening there now
-        err = at_send_command("AT+CGACT=0,1", NULL);
+        asprintf(&cmd, "AT+CGACT=0,%d", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
         // Start data on PDP context 1
-        err = at_send_command("ATD*99***1#", &p_response);
+        asprintf(&cmd, "ATD*99***%d#", cid);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
+        // Retrieve dynamic properties & setup kernel iface
+        asprintf(&cmd, "AT+CGCONTRDP=%d", cid);
+        err = at_send_command_singleline(cmd, "+CGCONTRDP:", &p_response);
+        free(cmd);
         if (err < 0 || p_response->success == 0) {
             goto error;
         }
+
+        if (parseCGCONTRDP(p_response->p_intermediates->line, &tmp_rp) < 0)
+            goto error;
+
+        ret = configureInterface(tmp_rp.ifname, tmp_rp.addresses);
+        if (ret < 0) {
+            deconfigureInterface(tmp_rp.ifname);
+            freeParsedCGCONTRDP(&tmp_rp);
+            goto error;
+        }
+
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &tmp_rp, sizeof(tmp_rp));
+
+        freeParsedCGCONTRDP(&tmp_rp);
+        at_response_free(p_response);
+
+        return;
     }
 
     requestOrSendDataCallList(&t);
@@ -2062,8 +2332,8 @@ error:
 static void requestDeactivateDataCall(void *data, size_t datalen __unused, RIL_Token t)
 {
     ATResponse *p_response = NULL;
-    int err;
-    char *cmd, *cid;
+    int err, id;
+    char *cmd, *cid, *ifname;
 
     cid = ((char **)data)[0];
     asprintf(&cmd, "AT+CGACT=0,%s", cid);
@@ -2071,6 +2341,20 @@ static void requestDeactivateDataCall(void *data, size_t datalen __unused, RIL_T
     if (err < 0 || p_response->success == 0) {
         goto error;
     }
+    free(cmd);
+
+    // +CGDCONT=<cid> causes the values for context number <cid> to become
+    // undefined.
+    asprintf(&cmd, "AT+CGDCONT=%s", cid);
+    err = at_send_command(cmd, &p_response);
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    id = atoi(cid) - 1;
+    asprintf(&ifname, "rmnet%d", id);
+    deconfigureInterface(ifname);
+    free(ifname);
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
     at_response_free(p_response);
@@ -3513,6 +3797,48 @@ static void probeForModemMode(ModemInfo *info)
     RLOGI("Found GSM Modem");
 }
 
+static void queryNumOfDataContexts()
+{
+    ATResponse *p_response;
+    ATLine *p_cur;
+    int err;
+
+    // +CGDCONT=? is used to query the ranges of supported PDP Contexts.
+    err = at_send_command_multiline("AT+CGDCONT=?", "+CGDCONT:", &p_response);
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    for (p_cur = p_response->p_intermediates; p_cur != NULL;
+         p_cur = p_cur->p_next) {
+        char *line = p_cur->line;
+        char *range;
+        int start, end;
+
+        err = at_tok_start(&line);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextstr(&line, &range);
+        if (err < 0)
+            goto error;
+
+        sscanf(range, "(%d-%d)", &start, &end);
+        // Assign to s_maxDataContexts the maximum range found.
+        if (end > s_maxDataContexts) {
+            s_maxDataContexts = end;
+        }
+    }
+    ALOGI("Number of data contexts: %d", s_maxDataContexts);
+
+    at_response_free(p_response);
+    return;
+
+error:
+    ALOGE("Error getting number of data contexts.");
+    at_response_free(p_response);
+}
+
 /**
  * Initialize everything that can be configured while we're still in
  * AT+CFUN=0
@@ -3527,6 +3853,9 @@ static void initializeCallback(void *param __unused)
     at_handshake();
 
     probeForModemMode(sMdmInfo);
+
+    queryNumOfDataContexts();
+
     /* note: we don't check errors here. Everything important will
        be handled in onATTimeout and onATReaderClosed */
 
@@ -3836,6 +4165,42 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         }
         free(line);
         RIL_onUnsolicitedResponse(RIL_UNSOL_SIGNAL_STRENGTH, &response, sizeof(response));
+    } else if (strStartsWith(s, "+CNAP:")) {
+        char* name = NULL;
+        int namePresentation = 0;
+        int len = 0;
+        line = p = strdup(s);
+        if (!line) {
+            ALOGE("+CNAP: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextstr(&p, &name) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextint(&p, &namePresentation) < 0) {
+            ALOGE("invalid +CNAP response: %s", s);
+            free(line);
+            return;
+        }
+
+        if (sCnapInfo.CNI_validity == 0) {
+          len  = strlen(name);
+          if (len >= A_CALL_NAME_MAX_SIZE) {
+            len = A_CALL_NAME_MAX_SIZE-1;
+          }
+          strncpy(sCnapInfo.name, name, len);
+        }
+        sCnapInfo.name[len] = '\0';
+        sCnapInfo.CNI_validity = namePresentation;
+
+        free(line);
     }
 }
 
