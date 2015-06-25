@@ -1114,7 +1114,7 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
     int err;
     char *line;
     RIL_SignalStrength_v6 response;
-    
+
     err = at_send_command_singleline("AT+CSQ", "+CSQ:", &p_response);
 
     if (err < 0 || p_response->success == 0) {
@@ -1146,8 +1146,10 @@ error:
  */
 static int networkModePossible(ModemInfo *mdm, int nm)
 {
-    if ((net2modem[nm] & mdm->supportedTechs) == net2modem[nm]) {
-       return 1;
+    if ((sizeof(net2pmask) / sizeof(int32_t)) > nm &&
+        (sizeof(net2modem) / sizeof(int)) > nm &&
+        (net2modem[nm] & mdm->supportedTechs) == net2modem[nm]) {
+        return 1;
     }
     return 0;
 }
@@ -1159,13 +1161,16 @@ static void requestSetPreferredNetworkType( int request, void *data,
     int value = *(int *)data;
     int current, old;
     int err;
-    int32_t preferred = net2pmask[value];
+    int32_t preferred;
 
-    RLOGD("requestSetPreferredNetworkType: current: %x. New: %x", PREFERRED_NETWORK(sMdmInfo), preferred);
     if (!networkModePossible(sMdmInfo, value)) {
         RIL_onRequestComplete(t, RIL_E_MODE_NOT_SUPPORTED, NULL, 0);
         return;
     }
+
+    preferred = net2pmask[value];
+    ALOGD("requestSetPreferredNetworkType: current: %x. New: %x", PREFERRED_NETWORK(sMdmInfo), preferred);
+
     if (query_ctec(sMdmInfo, &current, NULL) < 0) {
         RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
         return;
@@ -2933,6 +2938,70 @@ static void requestSetFacilityLock(void* data, size_t datalen, RIL_Token t)
     at_response_free(p_response);
 }
 
+static void requestChangeBarringPassword(void* data, size_t datalen, RIL_Token t)
+{
+    ATResponse   *p_response = NULL;
+    int           err;
+    char*         cmd = NULL;
+    const char**  strings = (const char**)data;
+
+    // Change call barring password. AT+CPWD=<fac>,<oldpwd>,<newpwd>
+    asprintf(&cmd, "AT+CPWD=\"%s\",\"%s\",\"%s\"", strings[0], strings[1], strings[2]);
+    err = at_send_command(cmd, &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        RIL_onRequestComplete(t, cmeErrorToRilError(at_get_cme_error(p_response)), NULL, 0);
+    } else {
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    }
+
+    at_response_free(p_response);
+}
+
+static void requestStkSendTerminalResponse(const void* data, size_t datalen, RIL_Token t) {
+    ATResponse *p_response = NULL;
+    int err;
+    char *cmd = NULL;
+    const char* response = (const char*) data;
+
+    // Send USAT terminal response: +CUSATT=<terminal_response>
+    asprintf(&cmd, "AT+CUSATT=%s", response);
+
+    err = at_send_command_singleline(cmd, "+CUSATT:", &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    } else {
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    }
+
+    at_response_free(p_response);
+}
+
+static void requestStkSendEnvelopeCommand(const void * data, size_t datalen, RIL_Token t) {
+    ATResponse *p_response = NULL;
+    int err;
+    char *cmd = NULL;
+    const char* envelope = (const char*) data;
+
+    //  Send USAT envelope command: +CUSATE=<envelope_command>
+    asprintf(&cmd, "AT+CUSATE=%s", envelope);
+
+    err = at_send_command_singleline(cmd, "+CUSATE:", &p_response);
+    free(cmd);
+
+    if (err < 0 || p_response->success == 0) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    } else {
+        // TODO fill in envelope response PDU
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    }
+
+    at_response_free(p_response);
+}
+
 /*** Callback methods from the RIL library to us ***/
 
 /**
@@ -3124,15 +3193,19 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             // 3GPP 22.030 6.5.5
             // "Places all active calls (if any exist) on hold and accepts
             //  the other (held or waiting) call."
-            at_send_command("AT+CHLD=2", NULL);
+            p_response = NULL;
+            err = at_send_command("AT+CHLD=2", &p_response);
 
 #ifdef WORKAROUND_ERRONEOUS_ANSWER
             s_expectAnswer = 1;
 #endif /* WORKAROUND_ERRONEOUS_ANSWER */
 
-            /* success or failure is ignored by the upper layer here.
-               it will call GET_CURRENT_CALLS and determine success that way */
-            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            if (err < 0 || p_response->success == 0) {
+                RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            } else {
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            }
+            at_response_free(p_response);
             break;
         case RIL_REQUEST_ANSWER:
             at_send_command("ATA", NULL);
@@ -3367,6 +3440,18 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
         case RIL_REQUEST_SET_FACILITY_LOCK:
             requestSetFacilityLock(data, datalen, t);
+            break;
+
+        case RIL_REQUEST_CHANGE_BARRING_PASSWORD:
+            requestChangeBarringPassword(data, datalen, t);
+            break;
+
+        case RIL_REQUEST_STK_SEND_TERMINAL_RESPONSE:
+            requestStkSendTerminalResponse(data, datalen, t);
+            break;
+
+        case RIL_REQUEST_STK_SEND_ENVELOPE_COMMAND:
+            requestStkSendEnvelopeCommand(data, datalen, t);
             break;
 
         default:
@@ -4308,8 +4393,35 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         }
         free(line);
         RIL_onUnsolicitedResponse(RIL_UNSOL_CDMA_PRL_CHANGED, &version, sizeof(version));
-    } else if (strStartsWith(s, "+CFUN: 0")) {
-        setRadioState(RADIO_STATE_OFF);
+    } else if (strStartsWith(s, "+CFUN:")) {
+        int state = -1;
+        line = p = strdup(s);
+        if (!line) {
+            ALOGE("+CFUN: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            ALOGE("invalid +CFUN response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextint(&p, &state) < 0) {
+            ALOGE("invalid +CFUN response: %s", s);
+            free(line);
+            return;
+        }
+        free(line);
+        switch (state) {
+            case 0:
+                setRadioState(RADIO_STATE_OFF);
+                break;
+            case 1:
+                setRadioState(RADIO_STATE_ON);
+                break;
+            default:
+                ALOGE("invalid +CFUN response: %s", s);
+                return;
+        }
     } else if (strStartsWith(s, "+CSQ:")) {
         RIL_SignalStrength_v6 response;
         line = p = strdup(s);
