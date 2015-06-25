@@ -41,7 +41,7 @@
 
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "Usage: %s -l <ril impl library> [-- <args for impl library>]\n", argv0);
+    fprintf(stderr, "Usage: %s -l <ril impl library> [-c <client id>] [-- <args for impl library>]\n", argv0);
     exit(EXIT_FAILURE);
 }
 
@@ -211,7 +211,8 @@ int main(int argc, char **argv)
 
                 sleep(1);
 
-                fd = qemu_pipe_open("qemud:gsm");
+                snprintf(buffer, sizeof(buffer), "qemud:gsm%s", clientId);
+                fd = qemu_pipe_open(buffer);
                 if (fd < 0) {
                     fd = socket_local_client(
                                 QEMUD_SOCKET_NAME,
