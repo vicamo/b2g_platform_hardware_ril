@@ -56,19 +56,9 @@ extern "C" {
 
 typedef void * RIL_Token;
 
-typedef enum {
-    RIL_SOCKET_1,
-#if (SIM_COUNT >= 2)
-    RIL_SOCKET_2,
-#if (SIM_COUNT >= 3)
-    RIL_SOCKET_3,
-#endif
-#if (SIM_COUNT >= 4)
-    RIL_SOCKET_4,
-#endif
-#endif
-    RIL_SOCKET_NUM
-} RIL_SOCKET_ID;
+typedef int RIL_SOCKET_ID;
+#define RIL_SOCKET_1   0
+#define RIL_SOCKET_NUM SIM_COUNT
 
 
 typedef enum {

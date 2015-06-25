@@ -57,9 +57,6 @@ namespace android {
 #define PHONE_PROCESS "radio"
 
 #define SOCKET_NAME_RIL "rild"
-#define SOCKET2_NAME_RIL "rild2"
-#define SOCKET3_NAME_RIL "rild3"
-#define SOCKET4_NAME_RIL "rild4"
 
 #define SOCKET_NAME_RIL_DEBUG "rild-debug"
 
@@ -182,45 +179,17 @@ static int s_fdDebug_socket2 = -1;
 static int s_fdWakeupRead;
 static int s_fdWakeupWrite;
 
-static struct ril_event s_commands_event;
+static struct ril_entity {
+    struct ril_event commandsEvent;
+    struct ril_event listenEvent;
+    SocketListenParam rilParam;
+
+    pthread_mutex_t pendingRequestsMutex;
+    pthread_mutex_t writeMutex;
+    RequestInfo *pendingRequests;
+} *s_ril_entities;
+
 static struct ril_event s_wakeupfd_event;
-static struct ril_event s_listen_event;
-static SocketListenParam s_ril_param_socket;
-
-static pthread_mutex_t s_pendingRequestsMutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t s_writeMutex = PTHREAD_MUTEX_INITIALIZER;
-static RequestInfo *s_pendingRequests = NULL;
-
-#if (SIM_COUNT >= 2)
-static struct ril_event s_commands_event_socket2;
-static struct ril_event s_listen_event_socket2;
-static SocketListenParam s_ril_param_socket2;
-
-static pthread_mutex_t s_pendingRequestsMutex_socket2  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t s_writeMutex_socket2            = PTHREAD_MUTEX_INITIALIZER;
-static RequestInfo *s_pendingRequests_socket2          = NULL;
-#endif
-
-#if (SIM_COUNT >= 3)
-static struct ril_event s_commands_event_socket3;
-static struct ril_event s_listen_event_socket3;
-static SocketListenParam s_ril_param_socket3;
-
-static pthread_mutex_t s_pendingRequestsMutex_socket3  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t s_writeMutex_socket3            = PTHREAD_MUTEX_INITIALIZER;
-static RequestInfo *s_pendingRequests_socket3          = NULL;
-#endif
-
-#if (SIM_COUNT >= 4)
-static struct ril_event s_commands_event_socket4;
-static struct ril_event s_listen_event_socket4;
-static SocketListenParam s_ril_param_socket4;
-
-static pthread_mutex_t s_pendingRequestsMutex_socket4  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t s_writeMutex_socket4            = PTHREAD_MUTEX_INITIALIZER;
-static RequestInfo *s_pendingRequests_socket4          = NULL;
-#endif
-
 static struct ril_event s_wake_timeout_event;
 static struct ril_event s_debug_event;
 
@@ -402,16 +371,11 @@ issueLocalRequest(int request, void *data, int len, RIL_SOCKET_ID socket_id) {
     int ret;
     /* Hook for current context */
     /* pendingRequestsMutextHook refer to &s_pendingRequestsMutex */
-    pthread_mutex_t* pendingRequestsMutexHook = &s_pendingRequestsMutex;
+    pthread_mutex_t* pendingRequestsMutexHook =
+        &s_ril_entities[socket_id].pendingRequestsMutex;
     /* pendingRequestsHook refer to &s_pendingRequests */
-    RequestInfo**    pendingRequestsHook = &s_pendingRequests;
-
-#if (SIM_COUNT == 2)
-    if (socket_id == RIL_SOCKET_2) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket2;
-        pendingRequestsHook = &s_pendingRequests_socket2;
-    }
-#endif
+    RequestInfo**    pendingRequestsHook =
+        &_ril_entities[socket_id].endingRequests;
 
     pRI = (RequestInfo *)calloc(1, sizeof(RequestInfo));
 
@@ -446,9 +410,11 @@ processCommandBuffer(void *buffer, size_t buflen, RIL_SOCKET_ID socket_id) {
     int ret;
     /* Hook for current context */
     /* pendingRequestsMutextHook refer to &s_pendingRequestsMutex */
-    pthread_mutex_t* pendingRequestsMutexHook = &s_pendingRequestsMutex;
+    pthread_mutex_t* pendingRequestsMutexHook =
+        &s_ril_entities[socket_id].pendingRequestsMutex;
     /* pendingRequestsHook refer to &s_pendingRequests */
-    RequestInfo**    pendingRequestsHook = &s_pendingRequests;
+    RequestInfo**    pendingRequestsHook =
+        &s_ril_entities[socket_id].pendingRequests;
 
     p.setData((uint8_t *) buffer, buflen);
 
@@ -457,25 +423,6 @@ processCommandBuffer(void *buffer, size_t buflen, RIL_SOCKET_ID socket_id) {
     status = p.readInt32 (&token);
 
     RLOGD("SOCKET %s REQUEST: %s length:%d", rilSocketIdToString(socket_id), requestToString(request), buflen);
-
-#if (SIM_COUNT >= 2)
-    if (socket_id == RIL_SOCKET_2) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket2;
-        pendingRequestsHook = &s_pendingRequests_socket2;
-    }
-#if (SIM_COUNT >= 3)
-    else if (socket_id == RIL_SOCKET_3) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket3;
-        pendingRequestsHook = &s_pendingRequests_socket3;
-    }
-#endif
-#if (SIM_COUNT >= 4)
-    else if (socket_id == RIL_SOCKET_4) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket4;
-        pendingRequestsHook = &s_pendingRequests_socket4;
-    }
-#endif
-#endif
 
     if (status != NO_ERROR) {
         RLOGE("invalid request block");
@@ -1969,31 +1916,13 @@ blockingWrite(int fd, const void *buffer, size_t len) {
 
 static int
 sendResponseRaw (const void *data, size_t dataSize, RIL_SOCKET_ID socket_id) {
-    int fd = s_ril_param_socket.fdCommand;
+    int fd = s_ril_entities[socket_id].rilParam.fdCommand;
     int ret;
     uint32_t header;
-    pthread_mutex_t * writeMutexHook = &s_writeMutex;
+    pthread_mutex_t * writeMutexHook = &s_ril_entities[socket_id].writeMutex;
 
     RLOGE("Send Response to %s", rilSocketIdToString(socket_id));
 
-#if (SIM_COUNT >= 2)
-    if (socket_id == RIL_SOCKET_2) {
-        fd = s_ril_param_socket2.fdCommand;
-        writeMutexHook = &s_writeMutex_socket2;
-    }
-#if (SIM_COUNT >= 3)
-    else if (socket_id == RIL_SOCKET_3) {
-        fd = s_ril_param_socket3.fdCommand;
-        writeMutexHook = &s_writeMutex_socket3;
-    }
-#endif
-#if (SIM_COUNT >= 4)
-    else if (socket_id == RIL_SOCKET_4) {
-        fd = s_ril_param_socket4.fdCommand;
-        writeMutexHook = &s_writeMutex_socket4;
-    }
-#endif
-#endif
     if (fd < 0) {
         return -1;
     }
@@ -3340,28 +3269,12 @@ static void onCommandsSocketClosed(RIL_SOCKET_ID socket_id) {
     RequestInfo *p_cur;
     /* Hook for current context
        pendingRequestsMutextHook refer to &s_pendingRequestsMutex */
-    pthread_mutex_t * pendingRequestsMutexHook = &s_pendingRequestsMutex;
+    pthread_mutex_t * pendingRequestsMutexHook =
+        &s_ril_entities[socket_id].pendingRequestsMutex;
     /* pendingRequestsHook refer to &s_pendingRequests */
-    RequestInfo **    pendingRequestsHook = &s_pendingRequests;
+    RequestInfo **    pendingRequestsHook =
+        &s_ril_entities[socket_id].pendingRequests;
 
-#if (SIM_COUNT >= 2)
-    if (socket_id == RIL_SOCKET_2) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket2;
-        pendingRequestsHook = &s_pendingRequests_socket2;
-    }
-#if (SIM_COUNT >= 3)
-    else if (socket_id == RIL_SOCKET_3) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket3;
-        pendingRequestsHook = &s_pendingRequests_socket3;
-    }
-#endif
-#if (SIM_COUNT >= 4)
-    else if (socket_id == RIL_SOCKET_4) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket4;
-        pendingRequestsHook = &s_pendingRequests_socket4;
-    }
-#endif
-#endif
     /* mark pending requests as "cancelled" so we dont report responses */
     ret = pthread_mutex_lock(pendingRequestsMutexHook);
     assert (ret == 0);
@@ -3604,30 +3517,12 @@ static void debugCallback (int fd, short flags, void *param) {
         char * buf = args[i];
         buf[len] = 0;
         if ((i+1) == number) {
-            /* The last argument should be sim id 0(SIM1)~3(SIM4) */
+            /* The last argument should be sim id 0(SIM1)~<RIL_SOCKET_NUM-1> */
             sim_id = atoi(args[i]);
-            switch (sim_id) {
-                case 0:
-                    socket_id = RIL_SOCKET_1;
-                    break;
-            #if (SIM_COUNT >= 2)
-                case 1:
-                    socket_id = RIL_SOCKET_2;
-                    break;
-            #endif
-            #if (SIM_COUNT >= 3)
-                case 2:
-                    socket_id = RIL_SOCKET_3;
-                    break;
-            #endif
-            #if (SIM_COUNT >= 4)
-                case 3:
-                    socket_id = RIL_SOCKET_4;
-                    break;
-            #endif
-                default:
-                    socket_id = RIL_SOCKET_1;
-                    break;
+            if (sim_id < 0 || sim_id >= RIL_SOCKET_NUM) {
+                socket_id = 0;
+            } else {
+                socket_id = sim_id;
             }
         }
     }
@@ -3642,16 +3537,10 @@ static void debugCallback (int fd, short flags, void *param) {
             data = 0;
             issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int), socket_id);
             // Close the socket
-            if (socket_id == RIL_SOCKET_1 && s_ril_param_socket.fdCommand > 0) {
-                close(s_ril_param_socket.fdCommand);
-                s_ril_param_socket.fdCommand = -1;
+            if (s_ril_entities[socket_id].rilParam.fdCommand > 0) {
+                close(s_ril_entities[socket_id].rilParam.fdCommand);
+                s_ril_entities[socket_id].rilParam.fdCommand = -1;
             }
-        #if (SIM_COUNT == 2)
-            else if (socket_id == RIL_SOCKET_2 && s_ril_param_socket2.fdCommand > 0) {
-                close(s_ril_param_socket2.fdCommand);
-                s_ril_param_socket2.fdCommand = -1;
-            }
-        #endif
             break;
         case 2:
             RLOGI ("Debug port: issuing unsolicited voice network change.");
@@ -3814,29 +3703,14 @@ static void startListen(RIL_SOCKET_ID socket_id, SocketListenParam* socket_liste
     char socket_name[10];
 
     memset(socket_name, 0, sizeof(char)*10);
-
-    switch(socket_id) {
-        case RIL_SOCKET_1:
-            strncpy(socket_name, RIL_getRilSocketName(), 9);
-            break;
-    #if (SIM_COUNT >= 2)
-        case RIL_SOCKET_2:
-            strncpy(socket_name, SOCKET2_NAME_RIL, 9);
-            break;
-    #endif
-    #if (SIM_COUNT >= 3)
-        case RIL_SOCKET_3:
-            strncpy(socket_name, SOCKET3_NAME_RIL, 9);
-            break;
-    #endif
-    #if (SIM_COUNT >= 4)
-        case RIL_SOCKET_4:
-            strncpy(socket_name, SOCKET4_NAME_RIL, 9);
-            break;
-    #endif
-        default:
-            RLOGE("Socket id is wrong!!");
-            return;
+    if (socket_id == RIL_SOCKET_1) {
+        strncpy(socket_name, RIL_getRilSocketName(), sizeof(socket_name) - 1);
+    } else if (socket_id < RIL_SOCKET_NUM) {
+        snprintf(socket_name, sizeof(socket_name), "%s%d",
+                 RIL_getRilSocketName(), socket_id);
+    } else {
+        RLOGE("Socket id is wrong!!");
+        return;
     }
 
     RLOGI("Start to listen %s", rilSocketIdToString(socket_id));
@@ -3867,6 +3741,7 @@ extern "C" void
 RIL_register (const RIL_RadioFunctions *callbacks) {
     int ret;
     int flags;
+    RIL_SOCKET_ID socket_id;
 
     RLOGI("SIM_COUNT: %d", SIM_COUNT);
 
@@ -3894,57 +3769,28 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
 
     memcpy(&s_callbacks, callbacks, sizeof (RIL_RadioFunctions));
 
-    /* Initialize socket1 parameters */
-    s_ril_param_socket = {
-                        RIL_SOCKET_1,             /* socket_id */
-                        -1,                       /* fdListen */
-                        -1,                       /* fdCommand */
-                        PHONE_PROCESS,            /* processName */
-                        &s_commands_event,        /* commands_event */
-                        &s_listen_event,          /* listen_event */
-                        processCommandsCallback,  /* processCommandsCallback */
-                        NULL                      /* p_rs */
-                        };
+    /* Initialize socket parameters */
+    s_ril_entities =
+        (struct ril_entity*) calloc(SIM_COUNT, sizeof(struct ril_entity));
+    if (NULL == s_ril_entities) {
+        RLOGE("RIL_register failed to allocate ril entities: %s",
+                strerror(errno));
+        return;
+    }
 
-#if (SIM_COUNT >= 2)
-    s_ril_param_socket2 = {
-                        RIL_SOCKET_2,               /* socket_id */
-                        -1,                         /* fdListen */
-                        -1,                         /* fdCommand */
-                        PHONE_PROCESS,              /* processName */
-                        &s_commands_event_socket2,  /* commands_event */
-                        &s_listen_event_socket2,    /* listen_event */
-                        processCommandsCallback,    /* processCommandsCallback */
-                        NULL                        /* p_rs */
-                        };
-#endif
+    for (socket_id = RIL_SOCKET_1; socket_id < SIM_COUNT; socket_id++) {
+        struct ril_entity *entity = &&s_ril_entities[socket_id];
+        SocketListenParam *param = &entity->rilParam;
 
-#if (SIM_COUNT >= 3)
-    s_ril_param_socket3 = {
-                        RIL_SOCKET_3,               /* socket_id */
-                        -1,                         /* fdListen */
-                        -1,                         /* fdCommand */
-                        PHONE_PROCESS,              /* processName */
-                        &s_commands_event_socket3,  /* commands_event */
-                        &s_listen_event_socket3,    /* listen_event */
-                        processCommandsCallback,    /* processCommandsCallback */
-                        NULL                        /* p_rs */
-                        };
-#endif
-
-#if (SIM_COUNT >= 4)
-    s_ril_param_socket4 = {
-                        RIL_SOCKET_4,               /* socket_id */
-                        -1,                         /* fdListen */
-                        -1,                         /* fdCommand */
-                        PHONE_PROCESS,              /* processName */
-                        &s_commands_event_socket4,  /* commands_event */
-                        &s_listen_event_socket4,    /* listen_event */
-                        processCommandsCallback,    /* processCommandsCallback */
-                        NULL                        /* p_rs */
-                        };
-#endif
-
+        param->socket_id = socket_id;
+        param->fdListen = -1;
+        param->fdCommand = -1;
+        param->processName = PHONE_PROCESS;
+        param->commands_event = &entity->commandsEvent;
+        param->listen_event = &entity->listenEvent;
+        param->processCommandsCallback = processCommandsCallback;
+        param->p_rs = NULL;
+    }
 
     s_registerCalled = 1;
 
@@ -3967,23 +3813,12 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
         RIL_startEventLoop();
     }
 
-    // start listen socket1
-    startListen(RIL_SOCKET_1, &s_ril_param_socket);
+    // start listen sockets
+    for (socket_id = RIL_SOCKET_1; socket_id < SIM_COUNT; socket_id++) {
+        SocketListenParam *param = &s_ril_entities[socket_id].rilParam;
 
-#if (SIM_COUNT >= 2)
-    // start listen socket2
-    startListen(RIL_SOCKET_2, &s_ril_param_socket2);
-#endif /* (SIM_COUNT == 2) */
-
-#if (SIM_COUNT >= 3)
-    // start listen socket3
-    startListen(RIL_SOCKET_3, &s_ril_param_socket3);
-#endif /* (SIM_COUNT == 3) */
-
-#if (SIM_COUNT >= 4)
-    // start listen socket4
-    startListen(RIL_SOCKET_4, &s_ril_param_socket4);
-#endif /* (SIM_COUNT == 4) */
+        startListen(param->socket_id, param);
+    }
 
 
 #if 1
@@ -4026,32 +3861,18 @@ checkAndDequeueRequestInfo(struct RequestInfo *pRI) {
     int ret = 0;
     /* Hook for current context
        pendingRequestsMutextHook refer to &s_pendingRequestsMutex */
-    pthread_mutex_t* pendingRequestsMutexHook = &s_pendingRequestsMutex;
+    pthread_mutex_t* pendingRequestsMutexHook;
     /* pendingRequestsHook refer to &s_pendingRequests */
-    RequestInfo ** pendingRequestsHook = &s_pendingRequests;
+    RequestInfo ** pendingRequestsHook;
 
     if (pRI == NULL) {
         return 0;
     }
 
-#if (SIM_COUNT >= 2)
-    if (pRI->socket_id == RIL_SOCKET_2) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket2;
-        pendingRequestsHook = &s_pendingRequests_socket2;
-    }
-#if (SIM_COUNT >= 3)
-        if (pRI->socket_id == RIL_SOCKET_3) {
-            pendingRequestsMutexHook = &s_pendingRequestsMutex_socket3;
-            pendingRequestsHook = &s_pendingRequests_socket3;
-        }
-#endif
-#if (SIM_COUNT >= 4)
-    if (pRI->socket_id == RIL_SOCKET_4) {
-        pendingRequestsMutexHook = &s_pendingRequestsMutex_socket4;
-        pendingRequestsHook = &s_pendingRequests_socket4;
-    }
-#endif
-#endif
+    pendingRequestsMutexHook =
+        &s_ril_entities[pRI->socket_id].pendingRequestsMutex;
+    pendingRequestsHook =
+        &s_ril_entities[pRI->socket_id].pendingRequests;
     pthread_mutex_lock(pendingRequestsMutexHook);
 
     for(RequestInfo **ppCur = pendingRequestsHook
@@ -4076,9 +3897,9 @@ extern "C" void
 RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responselen) {
     RequestInfo *pRI;
     int ret;
-    int fd = s_ril_param_socket.fdCommand;
+    int fd;
     size_t errorOffset;
-    RIL_SOCKET_ID socket_id = RIL_SOCKET_1;
+    RIL_SOCKET_ID socket_id;
 
     pRI = (RequestInfo *)t;
 
@@ -4088,21 +3909,7 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
     }
 
     socket_id = pRI->socket_id;
-#if (SIM_COUNT >= 2)
-    if (socket_id == RIL_SOCKET_2) {
-        fd = s_ril_param_socket2.fdCommand;
-    }
-#if (SIM_COUNT >= 3)
-        if (socket_id == RIL_SOCKET_3) {
-            fd = s_ril_param_socket3.fdCommand;
-        }
-#endif
-#if (SIM_COUNT >= 4)
-    if (socket_id == RIL_SOCKET_4) {
-        fd = s_ril_param_socket4.fdCommand;
-    }
-#endif
-#endif
+    fd = s_ril_entities[socket_id].rilParam.fdCommand;
     RLOGD("RequestComplete, %s", rilSocketIdToString(socket_id));
 
     if (pRI->local > 0) {
@@ -4697,24 +4504,14 @@ requestToString(int request) {
 const char *
 rilSocketIdToString(RIL_SOCKET_ID socket_id)
 {
-    switch(socket_id) {
-        case RIL_SOCKET_1:
-            return "RIL_SOCKET_1";
-#if (SIM_COUNT >= 2)
-        case RIL_SOCKET_2:
-            return "RIL_SOCKET_2";
-#endif
-#if (SIM_COUNT >= 3)
-        case RIL_SOCKET_3:
-            return "RIL_SOCKET_3";
-#endif
-#if (SIM_COUNT >= 4)
-        case RIL_SOCKET_4:
-            return "RIL_SOCKET_4";
-#endif
-        default:
-            return "not a valid RIL";
+    static char buf[16];
+
+    if (socket_id < 0 || socket_id >= RIL_SOCKET_NUM) {
+        return "not a valid RIL";
     }
+
+    snprintf(buf, sizeof buf, "RIL_SOCKET_%d", socket_id);
+    return buf;
 }
 
 } /* namespace android */
