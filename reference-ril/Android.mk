@@ -31,6 +31,10 @@ ifeq ($(TARGET_DEVICE),dream)
   LOCAL_CFLAGS += -DPOLL_CALL_STATE -DUSE_QMI
 endif
 
+ifneq ($(filter generic%,$(TARGET_DEVICE)),)
+  LOCAL_CFLAGS += -DANDROID_MULTI_SIM
+endif
+
 ifeq (foo,foo)
   #build shared library
   LOCAL_SHARED_LIBRARIES += \

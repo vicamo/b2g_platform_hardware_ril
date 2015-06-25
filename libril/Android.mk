@@ -15,7 +15,11 @@ LOCAL_SHARED_LIBRARIES := \
     libhardware_legacy \
     librilutils
 
-#LOCAL_CFLAGS := -DANDROID_MULTI_SIM -DDSDA_RILD1
+LOCAL_CFLAGS :=
+ifneq ($(filter generic%,$(TARGET_DEVICE)),)
+  LOCAL_CFLAGS += -DANDROID_MULTI_SIM
+  #LOCAL_CFLAGS += -DDSDA_RILD1
+endif
 
 ifeq ($(SIM_COUNT), 2)
     LOCAL_CFLAGS += -DANDROID_SIM_COUNT_2
@@ -40,6 +44,9 @@ LOCAL_STATIC_LIBRARIES := \
     librilutils_static
 
 LOCAL_CFLAGS :=
+ifneq ($(filter generic%,$(TARGET_DEVICE)),)
+  LOCAL_CFLAGS += -DANDROID_MULTI_SIM
+endif
 
 LOCAL_MODULE:= libril_static
 
